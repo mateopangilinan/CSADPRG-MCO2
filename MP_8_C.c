@@ -1,21 +1,9 @@
 /*
 Last Names: Acosta, Cagigas, Pangilinan, Po
 Language: C
-Paradigm(s): Procedural Programming
-
-BUILD : gcc -Wall -Wextra -o bank MP_8_C.c
-RUN   : ./bank            (bank_transactions.csv must be in the working directory)
-
-ASSUMPTIONS
- - "Last month" (Report 1) is the calendar month of the latest transaction in
-   the dataset; AccountAge is measured up to the latest transaction date.
- - Report 2 compounds the interest daily for 30 days; each day's interest is
-   rounded to centavos. Menu [6] uses the same routine, so both always agree.
- - Report 3: TurnoverVelocity is 0 on days with no deposits (division by zero
-   is undefined); such days are Suspicious only if withdrawals >= Php 500,000.
- - Account names are matched case-insensitively. "Last, First" is accepted
-   as input and converted to "First Last".
- - Report 4 (custom report) is deferred to MCO3.
+Paradigm: Procedural programming
+Build: gcc -std=c11 -Wall -Wextra MP_8_C.c -o bank -lm
+Run: ./bank [--reports]
 */
 
 #include <stdio.h>
@@ -26,83 +14,35 @@ ASSUMPTIONS
 
 #define CSV_FILENAME "bank_transactions.csv"
 #define CSV_HEADER "account_name,account_number,date,time,currency,amount,type,current_balance"
-#define MAX_TXNS 20000
-#define MAX_ACCOUNTS 2000
-#define MAX_DAILY_RECS 20000
-#define MAX_LINE 512
-#define MAX_NAME 64
-#define MIN_INITIAL_DEPOSIT 5000.00
-#define MAX_AMOUNT 1.0e12
 #define ANNUAL_RATE 0.05
+#include <math.h>
+#include <errno.h>
 
 typedef struct {
-    char accountName[MAX_NAME];
-    long long accountNumber;
-    int day;
-    int month;
-    int year;
-    int hour;
-    int minute;
-    int second;
-    int seq;               /* original load order; breaks ties for equal timestamps */
-    char currency[16];
-    double amount;
-    char type[16];
-    double currentBalance;
+    char *name;
+    long long number;
+    int date, seconds, row, deposit;
+    double amount, balance;
 } Transaction;
 
+/* Each account owns a consecutive range of rows, sorted by date and time. */
 typedef struct {
-    char accountName[MAX_NAME];
-    long long accountNumber;
-    int firstDay;
-    int firstMonth;
-    int firstYear;
-    int lastDay;
-    int lastMonth;
-    int lastYear;
-    int lastSecOfDay;
-    int lastSeq;
-    double currentBalance;
-    double avgDailyBalance;
-    double expectedInterest;
-    int accountAge;
-    char privilegeTier[16];
-} AccountSummary;
+    int first, end;
+    long long number;
+    const char *name;
+    double average, interest, peak;
+} Account;
 
 typedef struct {
-    char accountName[MAX_NAME];
-    int day;
-    int month;
-    int year;
-    double totalWithdrawals;
-    int numDeposits;
-    double totalDeposits;
-    double turnoverVelocity;
-    char riskFlag[16];
-} DailyBehavior;
+    Transaction *rows;
+    int count, capacity;
+    Account *accounts;
+    int accountCount;
+    long long highest;
+    int latestDate;
+} Dataset;
 
-static Transaction g_txns[MAX_TXNS];
-static int g_txnCount = 0;
-static int g_seqCounter = 0;
-static int g_totalRowsRead = 0;
-static int g_invalidRows = 0;
-static int g_droppedRows = 0;
-static int g_dataLoaded = 0;
-static int g_inputEnded = 0;
-static long long g_maxAccountNumber = 1092000000LL;
-
-static AccountSummary g_accounts[MAX_ACCOUNTS];
-static int g_accountCount = 0;
-
-static AccountSummary g_report1[MAX_ACCOUNTS];
-static int g_report1Count = 0;
-
-static AccountSummary g_report2[MAX_ACCOUNTS];
-static int g_report2Count = 0;
-
-static DailyBehavior g_report3[MAX_DAILY_RECS];
-static int g_report3Count = 0;
-
+static Dataset data;
 static const char *g_currencyNames[] = {
     "",
     "Philippine Peso (PHP)",
@@ -115,191 +55,155 @@ static const char *g_currencyNames[] = {
 
 static double g_rates[] = {0.0, 1.00, 62.00, 0.40, 84.00, 72.00, 9.00};
 
-/* ------------------------------------------------------------------ */
-/* Input helpers (line based, EOF safe)                               */
-/* ------------------------------------------------------------------ */
 
-#define IN_OK 1
-#define IN_INVALID 0
-#define IN_EOF (-1)
-#define IN_BLANK 2
-
-/* Reads one line from stdin without the newline; discards any overflow. Returns 0 on EOF. */
-int readLine(char *buf, size_t size) {
-    size_t len;
-    if (fgets(buf, (int)size, stdin) == NULL) {
-        g_inputEnded = 1;
-        buf[0] = '\0';
-        return 0;
+static void *resize(void *ptr, size_t size) {
+    void *result = realloc(ptr, size);
+    if (result == NULL) {
+        fputs("Out of memory.\n", stderr);
+        exit(EXIT_FAILURE);
     }
-    len = strlen(buf);
-    if (len > 0 && buf[len - 1] == '\n') {
-        buf[--len] = '\0';
-    } else {
-        int c;
-        while ((c = getchar()) != '\n' && c != EOF) {
+    return result;
+}
+
+static char *copyText(const char *text) {
+    char *copy = resize(NULL, strlen(text) + 1);
+    return strcpy(copy, text);
+}
+
+/* A CSV record occupies one physical line. Grow the buffer for long names. */
+static int readLine(FILE *file, char **line, size_t *capacity) {
+    int c;
+    size_t used = 0;
+    while ((c = fgetc(file)) != EOF && c != '\n') {
+        if (used + 1 >= *capacity) {
+            *capacity = *capacity * 2 + 128;
+            *line = resize(*line, *capacity);
         }
+        (*line)[used++] = (char)c;
     }
-    if (len > 0 && buf[len - 1] == '\r') {
-        buf[len - 1] = '\0';
+    if (used == 0 && c == EOF) return 0;
+    if (*line == NULL) {
+        *capacity = 128;
+        *line = resize(NULL, *capacity);
     }
+    if (used && (*line)[used - 1] == '\r') used--;
+    (*line)[used] = '\0';
     return 1;
 }
 
-/* Returns 1 if the string has only whitespace. */
-int isBlank(const char *s) {
-    while (*s) {
-        if (!isspace((unsigned char)*s)) return 0;
-        s++;
-    }
-    return 1;
+static char *trim(char *s) {
+    while (isspace((unsigned char)*s)) s++;
+    size_t n = strlen(s);
+    while (n && isspace((unsigned char)s[n - 1])) s[--n] = '\0';
+    return s;
 }
 
-/* Prompts for a number. Commas are allowed (e.g. 10,000.00). */
-int promptDouble(const char *prompt, double *out) {
-    char line[128], clean[128], *endPtr;
-    size_t i, j = 0;
-    printf("%s", prompt);
-    if (!readLine(line, sizeof(line))) return IN_EOF;
-    if (isBlank(line)) return IN_BLANK;
-    for (i = 0; line[i] != '\0' && j < sizeof(clean) - 1; i++) {
-        if (line[i] != ',') clean[j++] = line[i];
-    }
-    clean[j] = '\0';
-    *out = strtod(clean, &endPtr);
-    while (*endPtr && isspace((unsigned char)*endPtr)) endPtr++;
-    if (endPtr == clean || *endPtr != '\0') return IN_INVALID;
-    if (!(*out > -MAX_AMOUNT && *out < MAX_AMOUNT)) return IN_INVALID; /* rejects nan/inf */
-    return IN_OK;
-}
-
-/* Prompts for an integer. */
-int promptInt(const char *prompt, int *out) {
-    char line[64], *endPtr;
-    long v;
-    printf("%s", prompt);
-    if (!readLine(line, sizeof(line))) return IN_EOF;
-    if (isBlank(line)) return IN_BLANK;
-    v = strtol(line, &endPtr, 10);
-    while (*endPtr && isspace((unsigned char)*endPtr)) endPtr++;
-    if (endPtr == line || *endPtr != '\0' || v < -1000000L || v > 1000000L) return IN_INVALID;
-    *out = (int)v;
-    return IN_OK;
-}
-
-/* Asks a Y/N question until answered. EOF counts as N. */
-int promptYesNo(const char *prompt) {
-    char line[32];
-    char *p;
-    for (;;) {
-        printf("%s", prompt);
-        if (!readLine(line, sizeof(line))) return 0;
-        p = line;
-        while (*p && isspace((unsigned char)*p)) p++;
-        if (*p == 'Y' || *p == 'y') return 1;
-        if (*p == 'N' || *p == 'n') return 0;
-        printf("Please enter Y or N.\n");
-    }
-}
-
-/* Rounds a monetary value to the nearest centavo. */
-double roundCents(double v) {
-    return (v < 0.0) ? -(double)((long long)(-v * 100.0 + 0.5)) / 100.0
-                     : (double)((long long)(v * 100.0 + 0.5)) / 100.0;
-}
-
-/* ------------------------------------------------------------------ */
-/* Name helpers                                                       */
-/* ------------------------------------------------------------------ */
-
-/* Case-insensitive name comparison. */
-int compareNames(const char *a, const char *b) {
-    while (*a && *b) {
-        int ca = tolower((unsigned char)*a);
-        int cb = tolower((unsigned char)*b);
-        if (ca != cb) return ca - cb;
+static int sameText(const char *a, const char *b) {
+    while (*a && tolower((unsigned char)*a) == tolower((unsigned char)*b)) {
         a++;
         b++;
     }
-    return tolower((unsigned char)*a) - tolower((unsigned char)*b);
+    return *a == *b;
 }
 
-/* Trims, collapses spaces, and converts "Last, First" into "First Last". */
-void normalizeName(char *name) {
-    char tmp[128];
-    size_t i, j = 0;
-    int pendingSpace = 0;
-    char *comma;
+static int digits(const char *s, size_t n) {
+    for (size_t i = 0; i < n; i++)
+        if (s[i] < '0' || s[i] > '9') return 0;
+    return 1;
+}
 
-    for (i = 0; name[i] != '\0' && j < sizeof(tmp) - 1; i++) {
-        if (isspace((unsigned char)name[i])) {
-            pendingSpace = (j > 0);
-        } else {
-            if (pendingSpace) {
-                tmp[j++] = ' ';
-                pendingSpace = 0;
-            }
-            if (j < sizeof(tmp) - 1) tmp[j++] = name[i];
+/* Grouping commas must separate groups of three digits. */
+static int parseAmount(const char *s, double minimum, double *amount) {
+    const char *p = s;
+    if (*p == '+' || *p == '-') p++;
+    size_t first = strspn(p, "0123456789");
+    if (first == 0) return 0;
+    p += first;
+    if (*p == ',' && first > 3) return 0;
+    while (*p == ',') {
+        p++;
+        if (strspn(p, "0123456789") != 3) return 0;
+        p += 3;
+    }
+    if (*p == '.') {
+        p++;
+        size_t decimals = strspn(p, "0123456789");
+        if (decimals == 0) return 0;
+        p += decimals;
+    }
+    if (*p) return 0;
+    char *plain = copyText(s);
+    size_t length = 0;
+    for (p = s; *p; p++) if (*p != ',') plain[length++] = *p;
+    plain[length] = '\0';
+    long double value = strtold(plain, NULL);
+    if (!(value >= 0 && value < 1.0e12L) || (double)value < minimum) {
+        free(plain);
+        return 0;
+    }
+    /* Use the written third decimal to round half-cent inputs consistently. */
+    long long cents = strtoll(plain, NULL, 10) * 100;
+    const char *fraction = strchr(plain, '.');
+    if (fraction) {
+        fraction++;
+        cents += (fraction[0] - '0') * 10;
+        if (fraction[1]) {
+            cents += fraction[1] - '0';
+            if (fraction[2] >= '5') cents++;
         }
     }
-    tmp[j] = '\0';
+    free(plain);
+    *amount = cents / 100.0;
+    return 1;
+}
 
-    comma = strchr(tmp, ',');
-    if (comma != NULL && strchr(comma + 1, ',') == NULL) {
-        char left[128], right[128];
-        char *r = comma + 1;
-        size_t l = (size_t)(comma - tmp);
-        while (l > 0 && tmp[l - 1] == ' ') l--;
-        memcpy(left, tmp, l);
-        left[l] = '\0';
-        while (*r == ' ') r++;
-        snprintf(right, sizeof(right), "%s", r);
-        if (left[0] != '\0' && right[0] != '\0' && strlen(left) + strlen(right) + 2 <= sizeof(tmp)) {
-            size_t rl = strlen(right), ll = strlen(left);
-            memcpy(tmp, right, rl);
-            tmp[rl] = ' ';
-            memcpy(tmp + rl + 1, left, ll);
-            tmp[rl + 1 + ll] = '\0';
-        }
+// Round monetary results to centavos using half-up rounding.
+static double roundCents(double value) {
+    double cents = fabs(value) * 100;
+    if (cents == floor(cents)) return value;
+    return copysign(round(nextafter(cents, INFINITY)) / 100, value);
+}
+
+static char *prompt(const char *message) {
+    static char *line;
+    static size_t capacity;
+    printf("%s", message);
+    if (!readLine(stdin, &line, &capacity)) {
+        puts("\nInput ended.");
+        exit(EXIT_SUCCESS);
     }
-    snprintf(name, 128, "%s", tmp);
+    return trim(line);
 }
 
-/* A valid new account name has 2+ words made of letters, hyphens, apostrophes or periods. */
-int isValidFullName(const char *name) {
-    int words = 0, inWord = 0;
-    size_t i, len = strlen(name);
-    if (len == 0 || len >= MAX_NAME) return 0;
-    for (i = 0; i < len; i++) {
-        unsigned char c = (unsigned char)name[i];
-        if (c == ' ') {
-            inWord = 0;
-        } else if (isalpha(c) || c == '-' || c == '\'' || c == '.') {
-            if (!inWord) words++;
-            inWord = 1;
-        } else {
-            return 0;
-        }
+// Repeat the prompt until a whole number falls within the permitted range.
+static int readInt(const char *message, int min, int max) {
+    for (;;) {
+        char *s = prompt(message), *end;
+        long value = strtol(s, &end, 10);
+        if (end != s && !*end && value >= min && value <= max) return (int)value;
+        printf("Enter a whole number from %d to %d.\n", min, max);
     }
-    return words >= 2;
 }
 
-/* Prompts for an account name and normalizes it. Returns IN_OK / IN_BLANK / IN_EOF. */
-int promptName(const char *prompt, char *name, size_t size) {
-    char line[128];
-    printf("%s", prompt);
-    if (!readLine(line, sizeof(line))) return IN_EOF;
-    normalizeName(line);
-    if (line[0] == '\0') return IN_BLANK;
-    snprintf(name, size, "%s", line);
-    return IN_OK;
+// Check the original amount against the minimum before rounding.
+static double readAmount(const char *message, double minimum) {
+    for (;;) {
+        double value;
+        if (parseAmount(prompt(message), minimum, &value) && value >= minimum) return value;
+        printf("Enter a valid amount of at least PHP %.2f.\n", minimum);
+    }
 }
 
-/* ------------------------------------------------------------------ */
-/* Formatting / date helpers                                          */
-/* ------------------------------------------------------------------ */
+// Accept only Y or N for repeated menu operations.
+static int yesNo(const char *message) {
+    for (;;) {
+        const char *answer = prompt(message);
+        if (sameText(answer, "Y")) return 1;
+        if (sameText(answer, "N")) return 0;
+        puts("Enter Y or N.");
+    }
+}
 
-/* Prints the 6 supported currency options. */
 void printCurrencyOptions(void) {
     int i;
     for (i = 1; i <= 6; i++) {
@@ -307,81 +211,22 @@ void printCurrencyOptions(void) {
     }
 }
 
-/* Formats a double with comma separators and the given number of decimals. */
-static void formatWithCommas(double value, int decimals, char *outBuf, size_t bufSize) {
-    char raw[64];
-    char intPart[64];
-    char decPart[16];
-    char formatted[64];
-    char *dot;
-    int isNeg = 0;
-    int len;
-    int i, j, count;
-
-    if (value < 0.0) {
-        isNeg = 1;
-        value = -value;
+/* Insert grouping commas in the integer part of a two-decimal amount. */
+static void money(double value, char out[64]) {
+    char plain[64];
+    snprintf(plain, sizeof(plain), "%.2f", roundCents(value));
+    const char *digitsStart = plain;
+    char *next = out;
+    if (*digitsStart == '-') {
+        *next++ = '-';
+        digitsStart++;
     }
-
-    snprintf(raw, sizeof(raw), "%.*f", decimals, value);
-    dot = strchr(raw, '.');
-    if (dot != NULL) {
-        size_t intLen = (size_t)(dot - raw);
-        memcpy(intPart, raw, intLen);
-        intPart[intLen] = '\0';
-        snprintf(decPart, sizeof(decPart), "%s", dot);
-    } else {
-        snprintf(intPart, sizeof(intPart), "%s", raw);
-        decPart[0] = '\0';
+    size_t whole = strspn(digitsStart, "0123456789");
+    for (size_t i = 0; i < whole; i++) {
+        if (i && (whole - i) % 3 == 0) *next++ = ',';
+        *next++ = digitsStart[i];
     }
-
-    len = (int)strlen(intPart);
-    j = 0;
-    count = 0;
-    for (i = len - 1; i >= 0; i--) {
-        if (count > 0 && count % 3 == 0) {
-            formatted[j++] = ',';
-        }
-        formatted[j++] = intPart[i];
-        count++;
-    }
-    if (isNeg) {
-        formatted[j++] = '-';
-    }
-    formatted[j] = '\0';
-
-    for (i = 0; i < j / 2; i++) {
-        char tmp = formatted[i];
-        formatted[i] = formatted[j - 1 - i];
-        formatted[j - 1 - i] = tmp;
-    }
-
-    snprintf(outBuf, bufSize, "%s%s", formatted, decPart);
-}
-
-/* e.g. 1234567.891 -> "1,234,567.89" */
-void formatCommaNumber(double value, char *outBuf, size_t bufSize) {
-    formatWithCommas(value, 2, outBuf, bufSize);
-}
-
-/* e.g. 9191 -> "9,191" */
-void formatCommaInt(long long value, char *outBuf, size_t bufSize) {
-    formatWithCommas((double)value, 0, outBuf, bufSize);
-}
-
-/* Writes a CSV text field, quoting it if it contains a comma or quote. */
-void writeCsvText(FILE *fp, const char *s) {
-    if (strpbrk(s, ",\"") != NULL) {
-        const char *p;
-        fputc('"', fp);
-        for (p = s; *p; p++) {
-            if (*p == '"') fputc('"', fp);
-            fputc(*p, fp);
-        }
-        fputc('"', fp);
-    } else {
-        fputs(s, fp);
-    }
+    strcpy(next, digitsStart + whole);
 }
 
 /* Returns 1 if year is a leap year, 0 otherwise. */
@@ -403,7 +248,7 @@ int daysInMonth(int month, int year) {
 
 /* Validates a calendar date. */
 int isValidDate(int d, int m, int y) {
-    if (y < 1900 || y > 2100 || m < 1 || m > 12) {
+    if (y < 1 || y > 9999 || m < 1 || m > 12) {
         return 0;
     }
     if (d < 1 || d > daysInMonth(m, y)) {
@@ -420,955 +265,739 @@ long dateToJDN(int d, int m, int y) {
     return d + (153 * mo + 2) / 5 + 365L * yr + yr / 4 - yr / 100 + yr / 400 - 32045;
 }
 
-/* Compares two dates: returns -1, 0, or 1. */
-int compareDates(int d1, int m1, int y1, int d2, int m2, int y2) {
-    if (y1 != y2) return (y1 < y2) ? -1 : 1;
-    if (m1 != m2) return (m1 < m2) ? -1 : 1;
-    if (d1 != d2) return (d1 < d2) ? -1 : 1;
-    return 0;
+
+static int parseDate(const char *s) {
+    int d, m, y;
+    if (strlen(s) != 10 || s[2] != '/' || s[5] != '/' ||
+        !digits(s, 2) || !digits(s + 3, 2) || !digits(s + 6, 4)) return 0;
+    d = atoi(s);
+    m = atoi(s + 3);
+    y = atoi(s + 6);
+    if (!isValidDate(d, m, y)) return 0;
+    return y * 10000 + m * 100 + d;
 }
 
-/* ------------------------------------------------------------------ */
-/* Interest                                                           */
-/* ------------------------------------------------------------------ */
-
-/* Daily interest = balance x (annual rate / 365), rounded to centavos. */
-double dailyInterest(double balance) {
-    return roundCents(balance * (ANNUAL_RATE / 365.0));
+static int parseTime(const char *s) {
+    size_t hour = strspn(s, "0123456789");
+    if ((hour != 1 && hour != 2) || strlen(s) != hour + 6 || s[hour] != ':' ||
+        s[hour + 3] != ':' || !digits(s + hour + 1, 2) || !digits(s + hour + 4, 2)) return -1;
+    int h = atoi(s), m = atoi(s + hour + 1), sec = atoi(s + hour + 4);
+    if (h > 23 || m > 59 || sec > 59) return -1;
+    return h * 3600 + m * 60 + sec;
 }
 
-/* Total compounded interest over `days` days (shared by Menu [6] and Report 2). */
-double projectInterest(double balance, int days) {
-    double total = 0.0;
-    int i;
-    for (i = 0; i < days; i++) {
-        double di = dailyInterest(balance);
-        balance += di;
-        total += di;
-    }
-    return total;
+static long dayNumber(int date) {
+    return dateToJDN(date % 100, date / 100 % 100, date / 10000);
 }
 
-/* ------------------------------------------------------------------ */
-/* Accounts and CSV                                                   */
-/* ------------------------------------------------------------------ */
-
-/* Finds an account index by name (case-insensitive), or -1 if not found. */
-int findAccountByName(const char *name) {
-    int i;
-    for (i = 0; i < g_accountCount; i++) {
-        if (compareNames(g_accounts[i].accountName, name) == 0) {
-            return i;
-        }
-    }
-    return -1;
+static void dateText(int date, char *out) {
+    sprintf(out, "%02d/%02d/%04d", date % 100, date / 100 % 100, date / 10000);
 }
 
-/* Builds the unique accounts table from loaded transactions. */
-void rebuildAccountSummaries(void) {
-    int i, idx;
-    g_accountCount = 0;
-
-    for (i = 0; i < g_txnCount; i++) {
-        Transaction *t = &g_txns[i];
-        int sec = t->hour * 3600 + t->minute * 60 + t->second;
-        idx = findAccountByName(t->accountName);
-
-        if (idx == -1) {
-            if (g_accountCount >= MAX_ACCOUNTS) {
-                continue;
-            }
-            idx = g_accountCount++;
-            snprintf(g_accounts[idx].accountName, sizeof(g_accounts[idx].accountName), "%s", t->accountName);
-            g_accounts[idx].accountNumber = t->accountNumber;
-            g_accounts[idx].firstDay = t->day;
-            g_accounts[idx].firstMonth = t->month;
-            g_accounts[idx].firstYear = t->year;
-            g_accounts[idx].lastDay = t->day;
-            g_accounts[idx].lastMonth = t->month;
-            g_accounts[idx].lastYear = t->year;
-            g_accounts[idx].lastSecOfDay = sec;
-            g_accounts[idx].lastSeq = t->seq;
-            g_accounts[idx].currentBalance = t->currentBalance;
-        } else {
-            int cmpFirst = compareDates(t->day, t->month, t->year,
-                                        g_accounts[idx].firstDay, g_accounts[idx].firstMonth, g_accounts[idx].firstYear);
-            int cmpLast = compareDates(t->day, t->month, t->year,
-                                       g_accounts[idx].lastDay, g_accounts[idx].lastMonth, g_accounts[idx].lastYear);
-            if (cmpFirst < 0) {
-                g_accounts[idx].firstDay = t->day;
-                g_accounts[idx].firstMonth = t->month;
-                g_accounts[idx].firstYear = t->year;
-            }
-            if (cmpLast > 0 ||
-                (cmpLast == 0 && (sec > g_accounts[idx].lastSecOfDay ||
-                                  (sec == g_accounts[idx].lastSecOfDay && t->seq > g_accounts[idx].lastSeq)))) {
-                g_accounts[idx].lastDay = t->day;
-                g_accounts[idx].lastMonth = t->month;
-                g_accounts[idx].lastYear = t->year;
-                g_accounts[idx].lastSecOfDay = sec;
-                g_accounts[idx].lastSeq = t->seq;
-                g_accounts[idx].currentBalance = t->currentBalance;
-            }
-        }
-    }
-}
-
-/* Loads, validates, and cleans transactions from bank_transactions.csv. */
-int loadTransactionsFromCSV(int verbose) {
-    FILE *fp = fopen(CSV_FILENAME, "r");
-    char line[MAX_LINE];
-    int phpCount = 0;
-
-    if (fp == NULL) {
-        if (verbose) {
-            printf("Error: Could not open %s.\n", CSV_FILENAME);
-        }
-        return 0;
-    }
-
-    g_txnCount = 0;
-    g_seqCounter = 0;
-    g_totalRowsRead = 0;
-    g_invalidRows = 0;
-    g_droppedRows = 0;
-
-    if (fgets(line, sizeof(line), fp) == NULL) {
-        fclose(fp);
-        return 0;
-    }
-
-    while (fgets(line, sizeof(line), fp) != NULL) {
-        char *fields[8];
-        int fieldIdx = 0;
-        char *p = line;
-        char *newline;
-        int d, m, y, hh, mm, ss;
-        long long accNum;
-        double amt, bal;
-        char *endPtr;
-
-        newline = strpbrk(line, "\r\n");
-        if (newline != NULL) {
-            *newline = '\0';
-        } else if (!feof(fp)) {
-            /* line longer than buffer: count as one invalid row and skip the rest */
-            int c;
-            while ((c = fgetc(fp)) != '\n' && c != EOF) {
-            }
-            g_totalRowsRead++;
-            g_invalidRows++;
-            continue;
-        }
-        if (isBlank(line)) {
-            continue;
-        }
-
-        g_totalRowsRead++;
-
-        while (fieldIdx < 8) {
-            fields[fieldIdx++] = p;
-            p = strchr(p, ',');
-            if (p == NULL) {
-                break;
-            }
-            *p = '\0';
-            p++;
-        }
-
-        /* exactly 8 fields: a leftover comma means a 9th field */
-        if (fieldIdx < 8 || (p != NULL && *p != '\0') || strchr(fields[7], ',') != NULL) {
-            g_invalidRows++;
-            continue;
-        }
-
-        if (fields[0][0] == '\0' || fields[1][0] == '\0' || fields[2][0] == '\0' ||
-            fields[3][0] == '\0' || fields[4][0] == '\0' || fields[5][0] == '\0' ||
-            fields[6][0] == '\0' || fields[7][0] == '\0') {
-            g_invalidRows++;
-            continue;
-        }
-
-        accNum = strtoll(fields[1], &endPtr, 10);
-        if (*endPtr != '\0' || accNum <= 0) {
-            g_invalidRows++;
-            continue;
-        }
-
-        if (sscanf(fields[2], "%d/%d/%d", &d, &m, &y) != 3 || !isValidDate(d, m, y)) {
-            g_invalidRows++;
-            continue;
-        }
-
-        if (sscanf(fields[3], "%d:%d:%d", &hh, &mm, &ss) != 3 ||
-            hh < 0 || hh > 23 || mm < 0 || mm > 59 || ss < 0 || ss > 59) {
-            g_invalidRows++;
-            continue;
-        }
-
-        amt = strtod(fields[5], &endPtr);
-        if (*endPtr != '\0' || !(amt >= 0.0 && amt < MAX_AMOUNT)) {
-            g_invalidRows++;
-            continue;
-        }
-
-        bal = strtod(fields[7], &endPtr);
-        if (*endPtr != '\0' || !(bal > -MAX_AMOUNT && bal < MAX_AMOUNT)) {
-            g_invalidRows++;
-            continue;
-        }
-
-        if (strcmp(fields[6], "deposit") != 0 && strcmp(fields[6], "withdrawal") != 0) {
-            g_invalidRows++;
-            continue;
-        }
-
-        /* the row is structurally valid, so its account number counts as used */
-        if (accNum > g_maxAccountNumber) {
-            g_maxAccountNumber = accNum;
-        }
-
-        if (strcmp(fields[4], "PHP") != 0) {
-            continue;
-        }
-
-        if (g_txnCount < MAX_TXNS) {
-            Transaction *t = &g_txns[g_txnCount++];
-            snprintf(t->accountName, sizeof(t->accountName), "%s", fields[0]);
-            t->accountNumber = accNum;
-            t->day = d;
-            t->month = m;
-            t->year = y;
-            t->hour = hh;
-            t->minute = mm;
-            t->second = ss;
-            t->seq = g_seqCounter++;
-            snprintf(t->currency, sizeof(t->currency), "%s", fields[4]);
-            t->amount = amt;
-            snprintf(t->type, sizeof(t->type), "%s", fields[6]);
-            t->currentBalance = bal;
-            phpCount++;
-        } else {
-            g_droppedRows++;
-        }
-    }
-
-    fclose(fp);
-    g_dataLoaded = 1;
-    rebuildAccountSummaries();
-
-    if (verbose) {
-        char totalBuf[32], phpBuf[32];
-        formatCommaInt(g_totalRowsRead, totalBuf, sizeof(totalBuf));
-        formatCommaInt(phpCount, phpBuf, sizeof(phpBuf));
-        printf("Processing dataset... (%s rows loaded, %s filtered for PHP currency", totalBuf, phpBuf);
-        if (g_invalidRows > 0) {
-            printf(", %d invalid rows skipped", g_invalidRows);
-        }
-        printf(")\n");
-        if (g_droppedRows > 0) {
-            printf("Warning: %d rows exceeded the %d-transaction capacity and were not loaded.\n",
-                   g_droppedRows, MAX_TXNS);
-        }
-    }
-
-    return 1;
-}
-
-/* Makes sure the CSV exists, has a header, and ends with a CRLF before appending. */
-static int prepareCsvForAppend(void) {
-    FILE *fp = fopen(CSV_FILENAME, "rb");
-    long size = 0;
-    int last = '\n';
-
-    if (fp != NULL) {
-        fseek(fp, 0, SEEK_END);
-        size = ftell(fp);
-        if (size > 0) {
-            fseek(fp, -1, SEEK_END);
-            last = fgetc(fp);
-        }
-        fclose(fp);
-    }
-
-    fp = fopen(CSV_FILENAME, "ab");
-    if (fp == NULL) {
-        return 0;
-    }
-    if (size <= 0) {
-        fputs(CSV_HEADER "\r\n", fp);
-    } else if (last != '\n') {
-        fputs("\r\n", fp);
-    }
-    fclose(fp);
-    return 1;
-}
-
-/* Appends a single transaction row to bank_transactions.csv. */
-int appendTransactionToCSV(const char *accName, long long accNum, const char *type, double amount, double newBalance) {
-    FILE *fp;
-    time_t now = time(NULL);
-    struct tm *t = localtime(&now);
-    char dateStr[32];
-    char timeStr[32];
-    struct { int day, month, year, sec; } stamp;
-    int idx;
-
-    if (t == NULL || !prepareCsvForAppend() || (fp = fopen(CSV_FILENAME, "ab")) == NULL) {
-        printf("Error: Could not write to %s.\n", CSV_FILENAME);
-        return 0;
-    }
-
-    stamp.day = t->tm_mday;
-    stamp.month = t->tm_mon + 1;
-    stamp.year = t->tm_year + 1900;
-    stamp.sec = t->tm_hour * 3600 + t->tm_min * 60 + t->tm_sec;
-
-    /* The dataset may contain dates later than the system clock. Never stamp a new
-       row earlier than the account's latest transaction, or the balance would go stale. */
-    idx = findAccountByName(accName);
-    if (idx != -1) {
-        int c = compareDates(g_accounts[idx].lastDay, g_accounts[idx].lastMonth, g_accounts[idx].lastYear,
-                             stamp.day, stamp.month, stamp.year);
-        if (c > 0 || (c == 0 && g_accounts[idx].lastSecOfDay > stamp.sec)) {
-            stamp.day = g_accounts[idx].lastDay;
-            stamp.month = g_accounts[idx].lastMonth;
-            stamp.year = g_accounts[idx].lastYear;
-            stamp.sec = g_accounts[idx].lastSecOfDay;
-        }
-    }
-
-    snprintf(dateStr, sizeof(dateStr), "%02d/%02d/%04d", stamp.day, stamp.month, stamp.year);
-    snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d", stamp.sec / 3600, (stamp.sec / 60) % 60, stamp.sec % 60);
-
-    writeCsvText(fp, accName);
-    fprintf(fp, ",%lld,%s,%s,PHP,%.2f,%s,%.2f\r\n", accNum, dateStr, timeStr, amount, type, newBalance);
-    if (fclose(fp) != 0) {
-        printf("Error: Could not write to %s.\n", CSV_FILENAME);
-        return 0;
-    }
-
-    if (g_dataLoaded) {
-        Transaction *tx = &g_txns[g_txnCount++];
-        snprintf(tx->accountName, sizeof(tx->accountName), "%s", accName);
-        tx->accountNumber = accNum;
-        tx->day = stamp.day;
-        tx->month = stamp.month;
-        tx->year = stamp.year;
-        tx->hour = stamp.sec / 3600;
-        tx->minute = (stamp.sec / 60) % 60;
-        tx->second = stamp.sec % 60;
-        tx->seq = g_seqCounter++;
-        snprintf(tx->currency, sizeof(tx->currency), "PHP");
-        tx->amount = amount;
-        snprintf(tx->type, sizeof(tx->type), "%s", type);
-        tx->currentBalance = newBalance;
-        rebuildAccountSummaries();
-    } else {
-        loadTransactionsFromCSV(0);   /* file was missing before; sync memory with it */
-    }
-
-    return 1;
-}
-
-/* Returns 1 if another transaction row fits in memory. */
-static int hasTxnCapacity(void) {
-    if (g_txnCount >= MAX_TXNS) {
-        printf("Transaction storage is full (%d). Cannot record more transactions.\n", MAX_TXNS);
-        return 0;
-    }
-    return 1;
-}
-
-/* Menu [1]: Register Account */
-void handleRegisterAccount(void) {
-    if (!g_dataLoaded) {
-        loadTransactionsFromCSV(0);
-    }
-
-    do {
-        char name[MAX_NAME];
-        double initDeposit = 0.0;
-        int r, cancelled = 0;
-
-        printf("\nRegister Account\n");
-        r = promptName("Account Name (First Last): ", name, sizeof(name));
-        if (r == IN_EOF) {
-            break;
-        }
-
-        if (r == IN_BLANK) {
-            printf("Registration cancelled.\n");
-        } else if (!isValidFullName(name)) {
-            printf("Invalid name. Use a first and last name (letters, spaces, hyphens, apostrophes only).\n");
-        } else if (findAccountByName(name) != -1) {
-            printf("An account with that name already exists.\n");
-        } else if (g_accountCount >= MAX_ACCOUNTS) {
-            printf("Account storage is full (%d accounts).\n", MAX_ACCOUNTS);
-        } else if (hasTxnCapacity()) {
+/* Decode the eight fields in place, including doubled quotes in quoted names. */
+static int splitCsv(char *line, char *fields[]) {
+    char *read = line, *write = line;
+    int count = 0;
+    for (;;) {
+        if (count == 8) return 0;
+        char *start = write;
+        if (*read == '"') {
+            read++;
             for (;;) {
-                r = promptDouble("Initial Deposit (blank to cancel): ", &initDeposit);
-                if (r == IN_EOF || r == IN_BLANK) {
-                    cancelled = 1;
-                    break;
+                if (!*read) return 0;
+                if (*read == '"') {
+                    read++;
+                    if (*read != '"') break;
                 }
-                if (r == IN_OK && initDeposit >= MIN_INITIAL_DEPOSIT) {
-                    break;
-                }
-                printf("Invalid deposit. Minimum initial deposit is Php. 5,000.00.\n");
+                *write++ = *read++;
             }
-
-            if (cancelled) {
-                printf("Registration cancelled.\n");
-            } else {
-                long long newNumber = g_maxAccountNumber + 1;
-                initDeposit = roundCents(initDeposit);
-                if (appendTransactionToCSV(name, newNumber, "deposit", initDeposit, initDeposit)) {
-                    g_maxAccountNumber = newNumber;
-                    printf("\nAccount created successfully! (Account Number: %lld)\n", newNumber);
-                }
-            }
-        }
-    } while (!g_inputEnded && promptYesNo("\nRegister another account? (Y/N): "));
-}
-
-/* Menu [2]: Deposit Amount */
-void handleDepositAmount(void) {
-    if (!g_dataLoaded) {
-        loadTransactionsFromCSV(0);
-    }
-
-    do {
-        char name[MAX_NAME];
-        double deposit = 0.0;
-        int idx, r;
-
-        printf("\nDeposit Amount\n");
-        r = promptName("Account Name: ", name, sizeof(name));
-        if (r == IN_EOF) {
-            break;
-        }
-
-        idx = (r == IN_OK) ? findAccountByName(name) : -1;
-        if (idx == -1) {
-            printf("Account not found.\n");
+            while (isspace((unsigned char)*read)) read++;
+            if (*read && *read != ',') return 0;
         } else {
-            printf("Current Balance: %.2f\n", g_accounts[idx].currentBalance);
-            printf("Currency: PHP\n\n");
-            r = promptDouble("Deposit Amount: ", &deposit);
-            if (r == IN_OK && deposit > 0.0 && hasTxnCapacity()) {
-                double newBal = roundCents(g_accounts[idx].currentBalance + roundCents(deposit));
-                char accName[MAX_NAME];
-                long long accNum = g_accounts[idx].accountNumber;
-                snprintf(accName, sizeof(accName), "%s", g_accounts[idx].accountName);
-                if (appendTransactionToCSV(accName, accNum, "deposit", roundCents(deposit), newBal)) {
-                    printf("\nUpdated Balance: %.2f\n", newBal);
-                }
-            } else if (r != IN_EOF && !(r == IN_OK && deposit > 0.0)) {
-                printf("Invalid deposit amount.\n");
+            while (*read && *read != ',') {
+                if (*read == '"') return 0;
+                *write++ = *read++;
             }
         }
-    } while (!g_inputEnded && promptYesNo("\nDeposit another amount? (Y/N): "));
-}
-
-/* Menu [3]: Withdraw Amount */
-void handleWithdrawAmount(void) {
-    if (!g_dataLoaded) {
-        loadTransactionsFromCSV(0);
+        int more = *read == ',';
+        if (more) read++;
+        *write++ = '\0';
+        fields[count++] = trim(start);
+        if (!more) break;
     }
+    return count == 8;
+}
 
-    do {
-        char name[MAX_NAME];
-        double withdraw = 0.0;
-        int idx, r;
-
-        printf("\nWithdraw Amount\n");
-        r = promptName("Account Name: ", name, sizeof(name));
-        if (r == IN_EOF) {
-            break;
+// Quote output fields and escape embedded quotation marks.
+static void csvRow(FILE *file, const char *fields[], int count) {
+    for (int i = 0; i < count; i++) {
+        if (i) fputc(',', file);
+        fputc('"', file);
+        for (const char *p = fields[i]; *p; p++) {
+            if (*p == '"') fputc('"', file);
+            fputc(*p, file);
         }
+        fputc('"', file);
+    }
+    fputc('\n', file);
+}
 
-        idx = (r == IN_OK) ? findAccountByName(name) : -1;
-        if (idx == -1) {
-            printf("Account not found.\n");
-        } else {
-            printf("Current Balance: %.2f\n", g_accounts[idx].currentBalance);
-            printf("Currency: PHP\n\n");
-            r = promptDouble("Withdraw Amount: ", &withdraw);
-            if (r == IN_OK && withdraw > 0.0) {
-                withdraw = roundCents(withdraw);
-                if (withdraw > g_accounts[idx].currentBalance) {
-                    printf("Insufficient balance.\n");
-                } else if (hasTxnCapacity()) {
-                    double newBal = roundCents(g_accounts[idx].currentBalance - withdraw);
-                    char accName[MAX_NAME];
-                    long long accNum = g_accounts[idx].accountNumber;
-                    snprintf(accName, sizeof(accName), "%s", g_accounts[idx].accountName);
-                    if (appendTransactionToCSV(accName, accNum, "withdrawal", withdraw, newBal)) {
-                        printf("\nUpdated Balance: %.2f\n", newBal);
-                    }
-                }
-            } else if (r != IN_EOF) {
-                printf("Invalid withdrawal amount.\n");
+static int byNumber(long long a, long long b) {
+    if (a < b) return -1;
+    return a > b;
+}
+
+static int compareTransactions(const void *left, const void *right) {
+    const Transaction *a = left, *b = right;
+    if (a->number != b->number) return byNumber(a->number, b->number);
+    if (a->date != b->date) return a->date - b->date;
+    if (a->seconds != b->seconds) return a->seconds - b->seconds;
+    return a->row - b->row;
+}
+
+static void addTransaction(Dataset *set, Transaction tx) {
+    if (set->count == set->capacity) {
+        set->capacity = 2 * set->capacity + 128;
+        set->rows = resize(set->rows, (size_t)set->capacity * sizeof(tx));
+    }
+    set->rows[set->count++] = tx;
+    if (tx.date > set->latestDate) set->latestDate = tx.date;
+}
+
+// Group chronological history by account number and retain the latest balance.
+static void buildAccounts(Dataset *set) {
+    set->accountCount = 0;
+    if (!set->count) return;
+    qsort(set->rows, set->count, sizeof(*set->rows), compareTransactions);
+    set->accounts = resize(set->accounts, (size_t)set->count * sizeof(Account));
+    int i = 0;
+    while (i < set->count) {
+        Account a = {0};
+        a.first = i;
+        a.number = set->rows[i].number;
+        a.name = set->rows[i].name;
+        while (i < set->count && set->rows[i].number == a.number) i++;
+        a.end = i;
+        set->accounts[set->accountCount++] = a;
+    }
+}
+
+// Free transaction names and arrays owned by the dataset.
+static void releaseDataset(Dataset *set) {
+    for (int i = 0; i < set->count; i++) free(set->rows[i].name);
+    free(set->rows);
+    free(set->accounts);
+}
+
+// Validate into a temporary dataset before replacing the active accounts.
+static int loadData(void) {
+    Dataset next = {0};
+    next.highest = -1;
+    char *line = NULL, *fields[8];
+    size_t capacity = 0;
+    int rows = 0, excluded = 0, invalid = 0, ok = 0;
+    FILE *fp = fopen(CSV_FILENAME, "rb");
+    if (!fp && errno == ENOENT) fp = fopen(CSV_FILENAME, "w+b");
+    if (!fp) {
+        perror(CSV_FILENAME);
+        return 0;
+    }
+    if (!readLine(fp, &line, &capacity) && feof(fp)) {
+        fclose(fp);
+        fp = fopen(CSV_FILENAME, "w+b");
+        if (!fp) { perror(CSV_FILENAME); return 0; }
+        fputs(CSV_HEADER "\n", fp);
+        rewind(fp);
+        readLine(fp, &line, &capacity);
+    }
+    char expected[] = CSV_HEADER;
+    char *header[8], *start = line;
+    if (start && strncmp(start, "\xEF\xBB\xBF", 3) == 0) start += 3;
+    if (!start || !splitCsv(start, fields) || !splitCsv(expected, header)) goto done;
+    for (int i = 0; i < 8; i++) if (strcmp(fields[i], header[i])) goto done;
+    while (readLine(fp, &line, &capacity)) {
+        Transaction tx = {0};
+        rows++;
+        if (!splitCsv(line, fields) || strlen(fields[1]) != 10 || !digits(fields[1], 10)) goto badRow;
+        tx.number = strtoll(fields[1], NULL, 10);
+        if (tx.number > next.highest) next.highest = tx.number;
+        for (int i = 0; i < 8; i++) if (!*fields[i]) goto badRow;
+        if (!sameText(fields[4], "PHP")) { excluded++; continue; }
+        tx.date = parseDate(fields[2]);
+        tx.seconds = parseTime(fields[3]);
+        tx.deposit = sameText(fields[6], "deposit");
+        if (!tx.date || tx.seconds < 0 || (!tx.deposit && !sameText(fields[6], "withdrawal")) ||
+            !parseAmount(fields[5], 0, &tx.amount) || !parseAmount(fields[7], 0, &tx.balance)) goto badRow;
+        if (tx.amount <= 0) goto badRow;
+        tx.row = rows;
+        tx.name = copyText(fields[0]);
+        addTransaction(&next, tx);
+        continue;
+badRow:
+        invalid++;
+        printf("Row %d: invalid or missing CSV field.\n", rows + 1);
+    }
+    if (ferror(fp)) goto done;
+    // Group chronological history by account number and retain the latest balance.
+    buildAccounts(&next);
+    if (next.highest < 0) next.highest = 999999999;
+    // Free transaction names and arrays owned by the dataset.
+    releaseDataset(&data);
+    data = next;
+    printf("Rows read: %d; valid PHP: %d; non-PHP excluded: %d; invalid rows: %d.\n",
+           rows, data.count, excluded, invalid);
+    ok = 1;
+done:
+    if (!ok) {
+        puts("Could not load bank_transactions.csv. Check the header and file.");
+        // Free transaction names and arrays owned by the dataset.
+        releaseDataset(&next);
+    }
+    free(line);
+    fclose(fp);
+    return ok;
+}
+
+static Transaction *latest(const Account *a) {
+    return &data.rows[a->end - 1];
+}
+
+// Display the same account details for deposits, withdrawals, and interest.
+static void printAccount(const Account *a) {
+    char balance[64];
+    money(latest(a)->balance, balance);
+    printf("Account Name: %s\nAccount Number: %010lld\nCurrent Balance: %s\nCurrency: PHP\n",
+           a->name, a->number, balance);
+}
+
+static Account *selectAccount(void) {
+    if (!data.accountCount) {
+        puts("Please register an account first.");
+        return NULL;
+    }
+    for (;;) {
+        char *id = prompt("Account Name or Number (0 to cancel): ");
+        if (!strcmp(id, "0")) return NULL;
+        long long number = -1;
+        if (strlen(id) == 10 && digits(id, 10)) number = strtoll(id, NULL, 10);
+        /* Accept the sample's "Last, First" lookup as well as the stored name. */
+        char *lookup = copyText(id);
+        char *comma = strchr(lookup, ',');
+        if (comma && !strchr(comma + 1, ',')) {
+            *comma = '\0';
+            char *reversed = resize(NULL, strlen(id) + 2);
+            sprintf(reversed, "%s %s", trim(comma + 1), trim(lookup));
+            free(lookup);
+            lookup = reversed;
+        }
+        Account *match = NULL;
+        int count = 0;
+        for (int i = 0; i < data.accountCount; i++) {
+            Account *a = &data.accounts[i];
+            if (a->number == number) { free(lookup); return a; }
+            if (sameText(a->name, id) || sameText(a->name, lookup)) {
+                match = a;
+                count++;
             }
         }
-    } while (!g_inputEnded && promptYesNo("\nWithdraw another amount? (Y/N): "));
+        free(lookup);
+        if (count == 1) return match;
+        if (count > 1) puts("Several accounts have that name. Enter the account number.");
+        else puts("Account not found.");
+    }
 }
 
-/* Menu [4]: Currency Exchange */
-void handleCurrencyExchange(void) {
+// Save the CSV record before updating the in-memory account balance.
+static int saveTransaction(const char *name, long long number, int deposit, double amount,
+                           double balance, const Account *account) {
+    time_t clock = time(NULL);
+    struct tm *now = localtime(&clock);
+    if (!now || balance >= 1.0e12) { puts("Invalid time or balance."); return 0; }
+    Transaction tx = {0};
+    tx.date = (now->tm_year + 1900) * 10000 + (now->tm_mon + 1) * 100 + now->tm_mday;
+    tx.seconds = now->tm_hour * 3600 + now->tm_min * 60 + now->tm_sec;
+    if (account && (latest(account)->date > tx.date ||
+        (latest(account)->date == tx.date && latest(account)->seconds > tx.seconds))) {
+        puts("This account has a future transaction. Check the dataset or system date.");
+        return 0;
+    }
+    char id[32], date[32], stamp[32], amountText[64], balanceText[64];
+    snprintf(id, sizeof(id), "%010lld", number);
+    dateText(tx.date, date);
+    strftime(stamp, sizeof(stamp), "%H:%M:%S", now);
+    snprintf(amountText, sizeof(amountText), "%.2f", amount);
+    snprintf(balanceText, sizeof(balanceText), "%.2f", balance);
+    const char *type = "withdrawal";
+    if (deposit) type = "deposit";
+    const char *fields[] = {name, id, date, stamp, "PHP", amountText, type, balanceText};
+    FILE *fp = fopen(CSV_FILENAME, "r+b");
+    if (!fp) { perror(CSV_FILENAME); return 0; }
+    if (fseek(fp, -1, SEEK_END) != 0) {
+        fclose(fp);
+        puts("Reload the transaction file first.");
+        return 0;
+    }
+    int last = fgetc(fp);
+    if (last == EOF || fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return 0; }
+    if (last != '\n' && last != '\r') fputc('\n', fp);
+    // Quote output fields and escape embedded quotation marks.
+    csvRow(fp, fields, 8);
+    int failed = ferror(fp);
+    if (fclose(fp) != 0 || failed) { perror(CSV_FILENAME); return 0; }
+
+    tx.name = copyText(name);
+    tx.number = number;
+    tx.deposit = deposit;
+    tx.amount = amount;
+    tx.balance = balance;
+    /* Later file order wins when timestamps match, including after reloading invalid rows. */
+    if (account) tx.row = latest(account)->row + 1;
+    addTransaction(&data, tx);
+    // Group chronological history by account number and retain the latest balance.
+    buildAccounts(&data);
+    if (number > data.highest) data.highest = number;
+    return 1;
+}
+
+// Assign the next available account number and save its initial deposit.
+static void registerAccount(void) {
     do {
-        int srcCurrency = 0, destCurrency = 0;
-        double srcAmount = 0.0, destAmount = 0.0;
-
-        printf("\nForeign Currency Exchange\n");
-        printf("Source Currency Option:\n");
-        printCurrencyOptions();
-
-        if (promptInt("\nSource Currency: ", &srcCurrency) != IN_OK || srcCurrency < 1 || srcCurrency > 6) {
-            printf("Invalid currency option.\n");
-            break;
+        puts("\nRegister Account");
+        if (data.highest >= 9999999999LL) { puts("No more ten-digit account numbers are available."); return; }
+        char *name = prompt("Account Name (First name Last name): ");
+        while (!strchr(name, ' ')) {
+            puts("Enter a first name and last name.");
+            name = prompt("Account Name: ");
         }
-
-        if (promptDouble("Source Amount: ", &srcAmount) != IN_OK || srcAmount < 0.0) {
-            printf("Invalid amount.\n");
-            break;
+        name = copyText(name);
+        double amount = readAmount("Initial Deposit: ", 5000);
+        if (saveTransaction(name, data.highest + 1, 1, amount, amount, NULL)) {
+            puts("Account created successfully!");
+            // Display the same account details for deposits, withdrawals, and interest.
+            printAccount(&data.accounts[data.accountCount - 1]);
         }
-
-        printf("\nExchanged Currency Options:\n");
-        printCurrencyOptions();
-
-        if (promptInt("\nExchange Currency: ", &destCurrency) != IN_OK || destCurrency < 1 || destCurrency > 6) {
-            printf("Invalid currency option.\n");
-            break;
-        }
-
-        destAmount = (srcAmount * g_rates[srcCurrency]) / g_rates[destCurrency];
-        printf("Exchange Amount: %.2f\n", destAmount);
-    } while (!g_inputEnded && promptYesNo("\nConvert another currency (Y/N)? "));
+        free(name);
+    } while (yesNo("Register another account? (Y/N): "));
 }
 
-/* Menu [5]: Record Exchange Rates */
-void handleRecordExchangeRates(void) {
-    int currencyIndex = 0;
-    double newRate = 0.0;
+// Share deposit and withdrawal prompts while checking the resulting balance.
+static void transact(int deposit) {
+    const char *title = "Withdraw Amount", *amountPrompt = "Withdraw Amount: ";
+    const char *again = "Withdraw another amount? (Y/N): ";
+    if (deposit) {
+        title = "Deposit Amount";
+        amountPrompt = "Deposit Amount: ";
+        again = "Deposit another amount? (Y/N): ";
+    }
+    do {
+        puts(title);
+        Account *a = selectAccount();
+        if (!a) return;
+        // Display the same account details for deposits, withdrawals, and interest.
+        printAccount(a);
+        double amount = readAmount(amountPrompt, 0.01);
+        double balance = latest(a)->balance - amount;
+        if (deposit) balance = latest(a)->balance + amount;
+        if (balance < 0) puts("Insufficient balance.");
+        else if (saveTransaction(a->name, a->number, deposit, amount, roundCents(balance), a)) {
+            char text[64];
+            money(balance, text);
+            printf("Updated Balance: %s\n", text);
+        }
+    } while (yesNo(again));
+}
 
-    printf("\nRecord Exchange Rate\n");
+// Convert the source amount through PHP into the selected target currency.
+static void currencyExchange(void) {
+    do {
+        puts("\nForeign Currency Exchange");
+        printCurrencyOptions();
+        int from = readInt("Source Currency: ", 1, 6);
+        double amount = readAmount("Source Amount: ", 0.01);
+        int to = readInt("Exchange Currency: ", 1, 6);
+        char result[64];
+        money(amount * g_rates[from] / g_rates[to], result);
+        printf("Exchange Amount: %s\n", result);
+    } while (yesNo("Convert another currency (Y/N)? "));
+}
+
+// Update a foreign exchange rate for this session while keeping PHP fixed at one.
+static void recordExchangeRate(void) {
+    puts("\nRecord Exchange Rate");
     printCurrencyOptions();
-
-    if (promptInt("\nSelect Foreign Currency: ", &currencyIndex) != IN_OK ||
-        currencyIndex < 2 || currencyIndex > 6) {
-        printf("Invalid currency option (PHP is the base currency and cannot be changed).\n");
-        return;
-    }
-
-    if (promptDouble("Exchange Rate: ", &newRate) == IN_OK && newRate > 0.0) {
-        g_rates[currencyIndex] = newRate;
-        printf("Exchange rate recorded.\n");
-    } else {
-        printf("Invalid exchange rate.\n");
+    int currency = readInt("Select Foreign Currency: ", 1, 6);
+    if (currency == 1) puts("PHP is the base currency. Its rate is always 1.00.");
+    else {
+        g_rates[currency] = readAmount("Exchange Rate (PHP per unit): ", 0.01);
+        puts("Exchange rate updated.");
     }
 }
 
-/* Menu [6]: Show Interest Amount */
-void handleShowInterestAmount(void) {
-    char name[MAX_NAME];
-    int days = 0;
-    int i, idx;
-    double tempBalance;
-
-    if (!g_dataLoaded) {
-        loadTransactionsFromCSV(0);
+// Display daily compounded interest without saving projected deposits.
+static void showInterest(void) {
+    puts("\nShow Interest Amount");
+    Account *a = selectAccount();
+    if (!a) return;
+    // Display the same account details for deposits, withdrawals, and interest.
+    printAccount(a);
+    puts("Interest Rate: 5% per annum");
+    int days = readInt("Total Number of Days: ", 1, 36500);
+    double balance = latest(a)->balance;
+    puts("Day | Interest | Balance |");
+    for (int day = 1; day <= days; day++) {
+        double interest = roundCents(balance * (ANNUAL_RATE / 365));
+        balance = roundCents(balance + interest);
+        char earned[64], projected[64];
+        money(interest, earned);
+        money(balance, projected);
+        printf("%d | %s | %s |\n", day, earned, projected);
     }
+}
 
-    printf("\nShow Interest Amount\n");
-    if (promptName("Account Name: ", name, sizeof(name)) != IN_OK ||
-        (idx = findAccountByName(name)) == -1) {
-        printf("Account not found.\n");
-        return;
-    }
+/* Report dates are relative to the latest valid PHP transaction. */
+typedef struct {
+    Account *account;
+    int period, deposits, withdrawals;
+    long long depositCents, withdrawalCents;
+} Activity;
 
-    tempBalance = g_accounts[idx].currentBalance;
-    printf("Current Balance: %.2f\n", tempBalance);
-    printf("Currency: PHP\n");
-    printf("Interest Rate: 5%%\n");
+// Aggregate daily and monthly activity in integer centavos.
+static void accumulate(Activity *activity, const Transaction *tx) {
+    long long cents = llround(tx->amount * 100);
+    if (tx->deposit) { activity->deposits++; activity->depositCents += cents; }
+    else { activity->withdrawals++; activity->withdrawalCents += cents; }
+}
 
-    if (promptInt("Total Number of Days: ", &days) == IN_OK && days > 0 && days <= 3650) {
-        printf("\nDay\t| Interest\t| Balance\t|\n");
-        for (i = 1; i <= days; i++) {
-            double di = dailyInterest(tempBalance);
-            tempBalance += di;
-            printf("%d\t| %.2f\t\t| %.2f\t|\n", i, di, tempBalance);
+// Avoid division by zero when a day has no deposits.
+static double turnover(const Activity *a) {
+    if (!a->depositCents) return 0; // The CSV displays N/A for this case.
+    return a->withdrawalCents * 100.0 / a->depositCents;
+}
+
+// Apply the withdrawal threshold and turnover threshold to daily totals.
+static int suspicious(const Activity *a) {
+    return a->withdrawalCents >= 50000000 || turnover(a) >= 90;
+}
+
+static int comparePeriod(const void *left, const void *right) {
+    const Activity *a = left, *b = right;
+    if (a->period != b->period) return a->period - b->period;
+    return byNumber(a->account->number, b->account->number);
+}
+
+static int compareDay(const void *left, const void *right) {
+    const Activity *a = left, *b = right;
+    if (a->period != b->period) return a->period - b->period;
+    int risk = suspicious(b) - suspicious(a);
+    if (risk) return risk;
+    return byNumber(a->account->number, b->account->number);
+}
+
+static int compareAverage(const void *left, const void *right) {
+    const Account *a = left, *b = right;
+    if (a->average > b->average) return -1;
+    if (a->average < b->average) return 1;
+    return byNumber(a->number, b->number);
+}
+
+static int compareInterest(const void *left, const void *right) {
+    const Account *a = left, *b = right;
+    if (a->interest > b->interest) return -1;
+    if (a->interest < b->interest) return 1;
+    return byNumber(a->number, b->number);
+}
+
+// Carry each closing balance through inactive days in the reporting month.
+static double averageBalance(const Account *a, int month) {
+    int days = daysInMonth(month % 100, month / 100);
+    int index = a->first;
+    long long sum = 0, closing = 0;
+    for (int day = 1; day <= days; day++) {
+        while (index < a->end && data.rows[index].date <= month * 100 + day) {
+            closing = llround(data.rows[index].balance * 100);
+            index++;
         }
-    } else {
-        printf("Invalid number of days (enter 1 to 3650).\n");
+        sum += closing; // Include the carried balance on inactive days.
     }
+    return (double)sum / (100 * days);
 }
 
-/* ------------------------------------------------------------------ */
-/* Reports                                                            */
-/* ------------------------------------------------------------------ */
-
-/* Comparator for Report 1: descending by AverageDailyBalance. */
-int cmpReport1(const void *a, const void *b) {
-    const AccountSummary *x = (const AccountSummary *)a;
-    const AccountSummary *y = (const AccountSummary *)b;
-    if (x->avgDailyBalance < y->avgDailyBalance) return 1;
-    if (x->avgDailyBalance > y->avgDailyBalance) return -1;
-    return compareNames(x->accountName, y->accountName);
-}
-
-/* Comparator for Report 2: descending by ExpectedInterest. */
-int cmpReport2(const void *a, const void *b) {
-    const AccountSummary *x = (const AccountSummary *)a;
-    const AccountSummary *y = (const AccountSummary *)b;
-    if (x->expectedInterest < y->expectedInterest) return 1;
-    if (x->expectedInterest > y->expectedInterest) return -1;
-    return compareNames(x->accountName, y->accountName);
-}
-
-/* Comparator for Report 3: ascending by Date, descending by RiskFlagLevel. */
-int cmpReport3(const void *a, const void *b) {
-    const DailyBehavior *x = (const DailyBehavior *)a;
-    const DailyBehavior *y = (const DailyBehavior *)b;
-    int dateCmp = compareDates(x->day, x->month, x->year, y->day, y->month, y->year);
-    int riskCmp;
-    if (dateCmp != 0) {
-        return dateCmp;
-    }
-    riskCmp = strcmp(y->riskFlag, x->riskFlag);   /* "Suspicious" sorts before "Normal" */
-    if (riskCmp != 0) {
-        return riskCmp;
-    }
-    return compareNames(x->accountName, y->accountName);
-}
-
-/* Comparator for grouping transactions by account, then chronologically (ties by file order). */
-int cmpTxnByAccDate(const void *a, const void *b) {
-    const Transaction *x = (const Transaction *)a;
-    const Transaction *y = (const Transaction *)b;
-    int nameCmp = compareNames(x->accountName, y->accountName);
-    int dateCmp, secX, secY;
-    if (nameCmp != 0) {
-        return nameCmp;
-    }
-    dateCmp = compareDates(x->day, x->month, x->year, y->day, y->month, y->year);
-    if (dateCmp != 0) {
-        return dateCmp;
-    }
-    secX = x->hour * 3600 + x->minute * 60 + x->second;
-    secY = y->hour * 3600 + y->minute * 60 + y->second;
-    if (secX != secY) {
-        return secX - secY;
-    }
-    return x->seq - y->seq;
-}
-
-/* Generates Reports 1, 2, 3 and summary.json. */
-void generateAllReports(void) {
-    int i, j, d;
-    int maxDay = 0, maxMonth = 0, maxYear = 0;
-    long maxJDN;
-    int targetDaysInMonth;
-    double totalDeposits = 0.0;
-    double totalWithdrawals = 0.0;
-    double totalBalance = 0.0;
-    double totalInterestExpense = 0.0;
+typedef struct {
+    const char *title, *filename;
+    int columns;
+    const char *header[7];
     FILE *fp;
-    static Transaction sortedTxns[MAX_TXNS];
+    int count;
+} Report;
 
-    if (!g_dataLoaded || g_txnCount == 0) {
-        printf("Please load the dataset first.\n");
-        return;
-    }
-
-    printf("Generating reports...\n");
-
-    for (i = 0; i < g_txnCount; i++) {
-        if (compareDates(g_txns[i].day, g_txns[i].month, g_txns[i].year, maxDay, maxMonth, maxYear) > 0) {
-            maxDay = g_txns[i].day;
-            maxMonth = g_txns[i].month;
-            maxYear = g_txns[i].year;
+static void outputRow(Report *r, const char *fields[]) {
+    // Quote output fields and escape embedded quotation marks.
+    csvRow(r->fp, fields, r->columns);
+    if (r->count < 2) {
+        for (int i = 0; i < r->columns; i++) {
+            if (i) printf(" | ");
+            printf("%s", fields[i]);
         }
-        if (strcmp(g_txns[i].type, "deposit") == 0) {
-            totalDeposits += g_txns[i].amount;
-        } else if (strcmp(g_txns[i].type, "withdrawal") == 0) {
-            totalWithdrawals += g_txns[i].amount;
-        }
+        putchar('\n');
     }
-
-    maxJDN = dateToJDN(maxDay, maxMonth, maxYear);
-    targetDaysInMonth = daysInMonth(maxMonth, maxYear);
-
-    memcpy(sortedTxns, g_txns, (size_t)g_txnCount * sizeof(Transaction));
-    qsort(sortedTxns, (size_t)g_txnCount, sizeof(Transaction), cmpTxnByAccDate);
-
-    /* Report 1: Banking Privilege Tiers */
-    g_report1Count = 0;
-    for (i = 0; i < g_accountCount; i++) {
-        AccountSummary acc = g_accounts[i];
-        double carryBalance = 0.0;
-        double eodBalance[32];
-        int hasTxnOnDay[32];
-        double sumEOD = 0.0;
-
-        for (d = 0; d < 32; d++) {
-            eodBalance[d] = 0.0;
-            hasTxnOnDay[d] = 0;
-        }
-
-        for (j = 0; j < g_txnCount; j++) {
-            if (compareNames(sortedTxns[j].accountName, acc.accountName) != 0) {
-                continue;
-            }
-            if (compareDates(sortedTxns[j].day, sortedTxns[j].month, sortedTxns[j].year, 1, maxMonth, maxYear) < 0) {
-                carryBalance = sortedTxns[j].currentBalance;
-            } else if (sortedTxns[j].month == maxMonth && sortedTxns[j].year == maxYear) {
-                eodBalance[sortedTxns[j].day] = sortedTxns[j].currentBalance;
-                hasTxnOnDay[sortedTxns[j].day] = 1;
-            }
-        }
-
-        for (d = 1; d <= targetDaysInMonth; d++) {
-            if (hasTxnOnDay[d]) {
-                carryBalance = eodBalance[d];
-            }
-            sumEOD += carryBalance;
-        }
-
-        acc.avgDailyBalance = sumEOD / (double)targetDaysInMonth;
-        acc.accountAge = (int)(maxJDN - dateToJDN(acc.firstDay, acc.firstMonth, acc.firstYear));
-
-        if (acc.avgDailyBalance >= 100000.00) {
-            if (acc.avgDailyBalance < 500000.00) {
-                snprintf(acc.privilegeTier, sizeof(acc.privilegeTier), "Silver");
-            } else if (acc.avgDailyBalance < 1000000.00) {
-                snprintf(acc.privilegeTier, sizeof(acc.privilegeTier), "Gold");
-            } else {
-                snprintf(acc.privilegeTier, sizeof(acc.privilegeTier), "Platinum");
-            }
-            g_report1[g_report1Count++] = acc;
-        }
-    }
-    qsort(g_report1, (size_t)g_report1Count, sizeof(AccountSummary), cmpReport1);
-
-    fp = fopen("report1_banking_privilege_tiers.csv", "w");
-    if (fp != NULL) {
-        fprintf(fp, "AccountName,AccountAge,CurrentBalance,AverageDailyBalance,PrivilegeTier\n");
-        for (i = 0; i < g_report1Count; i++) {
-            char balBuf[32], adbBuf[32];
-            formatCommaNumber(g_report1[i].currentBalance, balBuf, sizeof(balBuf));
-            formatCommaNumber(g_report1[i].avgDailyBalance, adbBuf, sizeof(adbBuf));
-            writeCsvText(fp, g_report1[i].accountName);
-            fprintf(fp, ",%d,\"%s\",\"%s\",%s\n",
-                    g_report1[i].accountAge, balBuf, adbBuf, g_report1[i].privilegeTier);
-        }
-        fclose(fp);
-    } else {
-        printf("Warning: could not write report1_banking_privilege_tiers.csv\n");
-    }
-
-    /* Report 2: Interest Expense Projection */
-    g_report2Count = 0;
-    for (i = 0; i < g_accountCount; i++) {
-        AccountSummary acc = g_accounts[i];
-        totalBalance += acc.currentBalance;
-
-        if (acc.currentBalance >= 10000.00) {
-            acc.expectedInterest = projectInterest(acc.currentBalance, 30);
-            totalInterestExpense += acc.expectedInterest;
-            g_report2[g_report2Count++] = acc;
-        }
-    }
-    qsort(g_report2, (size_t)g_report2Count, sizeof(AccountSummary), cmpReport2);
-
-    fp = fopen("report2_interest_expense_projection.csv", "w");
-    if (fp != NULL) {
-        fprintf(fp, "AccountName,CurrentBalance,ExpectedInterest\n");
-        for (i = 0; i < g_report2Count; i++) {
-            char balBuf[32], intBuf[32];
-            formatCommaNumber(g_report2[i].currentBalance, balBuf, sizeof(balBuf));
-            formatCommaNumber(g_report2[i].expectedInterest, intBuf, sizeof(intBuf));
-            writeCsvText(fp, g_report2[i].accountName);
-            fprintf(fp, ",\"%s\",\"%s\"\n", balBuf, intBuf);
-        }
-        fclose(fp);
-    } else {
-        printf("Warning: could not write report2_interest_expense_projection.csv\n");
-    }
-
-    /* Report 3: Suspicious Client Behavior */
-    g_report3Count = 0;
-    i = 0;
-    while (i < g_txnCount && g_report3Count < MAX_DAILY_RECS) {
-        DailyBehavior rec;
-        snprintf(rec.accountName, sizeof(rec.accountName), "%s", sortedTxns[i].accountName);
-        rec.day = sortedTxns[i].day;
-        rec.month = sortedTxns[i].month;
-        rec.year = sortedTxns[i].year;
-        rec.totalWithdrawals = 0.0;
-        rec.numDeposits = 0;
-        rec.totalDeposits = 0.0;
-
-        while (i < g_txnCount &&
-               compareNames(sortedTxns[i].accountName, rec.accountName) == 0 &&
-               sortedTxns[i].day == rec.day &&
-               sortedTxns[i].month == rec.month &&
-               sortedTxns[i].year == rec.year) {
-            if (strcmp(sortedTxns[i].type, "withdrawal") == 0) {
-                rec.totalWithdrawals += sortedTxns[i].amount;
-            } else if (strcmp(sortedTxns[i].type, "deposit") == 0) {
-                rec.numDeposits++;
-                rec.totalDeposits += sortedTxns[i].amount;
-            }
-            i++;
-        }
-
-        if (rec.totalDeposits > 0.0) {
-            rec.turnoverVelocity = (rec.totalWithdrawals / rec.totalDeposits) * 100.0;
-        } else {
-            rec.turnoverVelocity = 0.0;   /* undefined without deposits; see ASSUMPTIONS */
-        }
-
-        if (rec.totalWithdrawals >= 500000.00 || rec.turnoverVelocity >= 90.0) {
-            snprintf(rec.riskFlag, sizeof(rec.riskFlag), "Suspicious");
-        } else {
-            snprintf(rec.riskFlag, sizeof(rec.riskFlag), "Normal");
-        }
-
-        g_report3[g_report3Count++] = rec;
-    }
-    if (i < g_txnCount) {
-        printf("Warning: Report 3 capacity (%d rows) reached; remaining days omitted.\n", MAX_DAILY_RECS);
-    }
-    qsort(g_report3, (size_t)g_report3Count, sizeof(DailyBehavior), cmpReport3);
-
-    fp = fopen("report3_suspicious_client_behavior.csv", "w");
-    if (fp != NULL) {
-        fprintf(fp, "AccountName,Date,TotalWithdrawalAmounts,NumberOfDeposits,TotalDepositAmounts,TurnoverVelocity,RiskFlagLevel\n");
-        for (i = 0; i < g_report3Count; i++) {
-            char wBuf[32], dBuf[32], vBuf[32];
-            formatCommaNumber(g_report3[i].totalWithdrawals, wBuf, sizeof(wBuf));
-            formatCommaNumber(g_report3[i].totalDeposits, dBuf, sizeof(dBuf));
-            formatCommaNumber(g_report3[i].turnoverVelocity, vBuf, sizeof(vBuf));
-            writeCsvText(fp, g_report3[i].accountName);
-            fprintf(fp, ",%02d/%02d/%04d,\"%s\",%d,\"%s\",\"%s\",%s\n",
-                    g_report3[i].day, g_report3[i].month, g_report3[i].year,
-                    wBuf, g_report3[i].numDeposits, dBuf, vBuf, g_report3[i].riskFlag);
-        }
-        fclose(fp);
-    } else {
-        printf("Warning: could not write report3_suspicious_client_behavior.csv\n");
-    }
-
-    /* Summary JSON */
-    fp = fopen("summary.json", "w");
-    if (fp != NULL) {
-        fprintf(fp, "{\"total_accounts\": %d, \"total_deposits\": %.2f, \"total_withdrawals\": %.2f, \"total_balance\": %.2f, \"total_interest_expense\": %.2f}\n",
-                g_accountCount, totalDeposits, totalWithdrawals, totalBalance, totalInterestExpense);
-        fclose(fp);
-    } else {
-        printf("Warning: could not write summary.json\n");
-    }
-
-    printf("Outputs saved to individual files...\n\n");
-
-    printf("Report 1: Banking Privilege Tiers\n");
-    printf("%-22s | %-10s | %-15s | %-19s | %-10s\n",
-           "AccountName", "AccountAge", "CurrentBalance", "AverageDailyBalance", "Tier");
-    for (i = 0; i < g_report1Count && i < 2; i++) {
-        char balBuf[32], adbBuf[32];
-        formatCommaNumber(g_report1[i].currentBalance, balBuf, sizeof(balBuf));
-        formatCommaNumber(g_report1[i].avgDailyBalance, adbBuf, sizeof(adbBuf));
-        printf("%-22s | %-10d | %-15s | %-19s | %-10s\n",
-               g_report1[i].accountName, g_report1[i].accountAge, balBuf, adbBuf, g_report1[i].privilegeTier);
-    }
-    printf("(Full table exported to report1_banking_privilege_tiers.csv)\n\n");
-
-    printf("Report 2: Interest Expense Projection\n");
-    printf("%-22s | %-15s | %-16s\n", "AccountName", "CurrentBalance", "ExpectedInterest");
-    for (i = 0; i < g_report2Count && i < 2; i++) {
-        char balBuf[32], intBuf[32];
-        formatCommaNumber(g_report2[i].currentBalance, balBuf, sizeof(balBuf));
-        formatCommaNumber(g_report2[i].expectedInterest, intBuf, sizeof(intBuf));
-        printf("%-22s | %-15s | %-16s\n",
-               g_report2[i].accountName, balBuf, intBuf);
-    }
-    printf("(Full table exported to report2_interest_expense_projection.csv)\n\n");
-
-    printf("Report 3: Suspicious Client Behavior\n");
-    printf("%-20s | %-10s | %-14s | %-8s | %-14s | %-10s | %-10s\n",
-           "AccountName", "Date", "Withdrawals", "Deposits", "DepositAmt", "Velocity%", "RiskFlag");
-    for (i = 0; i < g_report3Count && i < 2; i++) {
-        char wBuf[32], dBuf[32], vBuf[32];
-        formatCommaNumber(g_report3[i].totalWithdrawals, wBuf, sizeof(wBuf));
-        formatCommaNumber(g_report3[i].totalDeposits, dBuf, sizeof(dBuf));
-        formatCommaNumber(g_report3[i].turnoverVelocity, vBuf, sizeof(vBuf));
-        printf("%-20s | %02d/%02d/%04d | %-14s | %-8d | %-14s | %-10s | %-10s\n",
-               g_report3[i].accountName, g_report3[i].day, g_report3[i].month, g_report3[i].year,
-               wBuf, g_report3[i].numDeposits, dBuf, vBuf, g_report3[i].riskFlag);
-    }
-    printf("(Full table exported to report3_suspicious_client_behavior.csv)\n\n");
-
-    printf("Summary State (summary.json):\n");
-    printf("{\"total_accounts\": %d, \"total_deposits\": %.2f, \"total_withdrawals\": %.2f, \"total_balance\": %.2f, \"total_interest_expense\": %.2f}\n",
-           g_accountCount, totalDeposits, totalWithdrawals, totalBalance, totalInterestExpense);
+    r->count++;
 }
 
-/* Menu [7]: Generate Reports */
-void handleGenerateReports(void) {
-    int subChoice = 0;
-    printf("\nGenerate Reports\n");
-    printf("[1] Load the file\n");
-    printf("[2] Generate Reports\n");
+static int openReport(Report *r) {
+    r->fp = fopen(r->filename, "wb");
+    if (!r->fp) { perror(r->filename); return 0; }
+    puts(r->title);
+    r->count = -1;
+    outputRow(r, r->header);
+    return 1;
+}
 
-    if (promptInt("Enter choice: ", &subChoice) != IN_OK) {
-        printf("Invalid choice.\n");
-        return;
+static int closeReport(Report *r) {
+    int failed = ferror(r->fp);
+    if (fclose(r->fp) != 0 || failed) { perror(r->filename); return 0; }
+    printf("%d rows exported to %s\n\n", r->count, r->filename);
+    return 1;
+}
+
+/* All report fields are quoted UTF-8 with LF line endings. */
+static int writePrivileges(Account *rows, int count, int date) {
+    Report report = {"Report 1: Banking Privilege Tiers", "report1_banking_privilege_tiers.csv", 5,
+        {"AccountName","AccountAge","CurrentBalance","AverageDailyBalance","PrivilegeTier"}, NULL, 0};
+    if (!openReport(&report)) return 0;
+    qsort(rows, count, sizeof(Account), compareAverage);
+    for (int i = 0; i < count; i++) {
+        Account *a = &rows[i];
+        if (a->average < 100000) break;
+        const char *tier = "Silver";
+        if (a->average >= 1000000) tier = "Platinum";
+        else if (a->average >= 500000) tier = "Gold";
+        char age[32], balance[64], average[64];
+        snprintf(age, sizeof(age), "%ld", dayNumber(date) - dayNumber(data.rows[a->first].date));
+        money(latest(a)->balance, balance);
+        money(a->average, average);
+        const char *fields[] = {a->name, age, balance, average, tier};
+        outputRow(&report, fields);
     }
+    return closeReport(&report);
+}
 
-    if (subChoice == 1) {
-        if (!loadTransactionsFromCSV(1)) {
-            printf("Could not load %s.\n", CSV_FILENAME);
+static int writeInterest(Account *rows, int count) {
+    Report report = {"Report 2: Interest Expense Projection", "report2_interest_expense_projection.csv", 3,
+        {"AccountName","CurrentBalance","ExpectedInterest"}, NULL, 0};
+    if (!openReport(&report)) return 0;
+    qsort(rows, count, sizeof(Account), compareInterest);
+    for (int i = 0; i < count; i++) {
+        Account *a = &rows[i];
+        if (latest(a)->balance < 10000) continue;
+        char balance[64], interest[64];
+        money(latest(a)->balance, balance);
+        money(a->interest, interest);
+        const char *fields[] = {a->name, balance, interest};
+        outputRow(&report, fields);
+    }
+    return closeReport(&report);
+}
+
+static int writeBehavior(Activity *rows, int count) {
+    Report report = {"Report 3: Suspicious Client Behavior", "report3_suspicious_client_behavior.csv", 7,
+        {"AccountName","Date","TotalWithdrawalAmounts","NumberOfDeposits","TotalDepositAmounts",
+         "TurnoverVelocity (%)","RiskFlagLevel"}, NULL, 0};
+    if (!openReport(&report)) return 0;
+    qsort(rows, count, sizeof(Activity), compareDay);
+    for (int i = 0; i < count; i++) {
+        Activity *a = &rows[i];
+        char date[32], w[64], d[64], deposits[32], velocity[64] = "N/A";
+        dateText(a->period, date);
+        snprintf(deposits, sizeof(deposits), "%d", a->deposits);
+        money(a->withdrawalCents / 100.0, w);
+        money(a->depositCents / 100.0, d);
+        if (a->depositCents) money(turnover(a), velocity);
+        const char *risk = "Normal";
+        if (suspicious(a)) risk = "Suspicious";
+        const char *fields[] = {a->account->name, date, w, deposits, d, velocity, risk};
+        outputRow(&report, fields);
+    }
+    return closeReport(&report);
+}
+
+/* Net flows show funding trends. Counts show how often a client transacted last month. */
+static int writeMonthly(Activity *rows, int count, int countsReport) {
+    Report flow = {"Report 4: Monthly Net Cash Flow", "report4_monthly_net_cash_flow.csv", 6,
+        {"AccountName","AccountNumber","Month","TotalDeposits","TotalWithdrawals","NetCashFlow"}, NULL, 0};
+    Report counts = {"Report 4: Monthly Account Activity", "report4_monthly_account_activity.csv", 7,
+        {"AccountName","AccountNumber","DepositCount","WithdrawalCount","TotalDeposits","TotalWithdrawals","NetCashFlow"}, NULL, 0};
+    Report *report = &flow;
+    if (countsReport) report = &counts;
+    if (!openReport(report)) return 0;
+    if (!countsReport) qsort(rows, count, sizeof(Activity), comparePeriod);
+    for (int i = 0; i < count; i++) {
+        Activity *a = &rows[i];
+        char number[32], period[32], dc[32], wc[32], deposits[64], withdrawals[64], net[64];
+        snprintf(number, sizeof(number), "%010lld", a->account->number);
+        money(a->depositCents / 100.0, deposits);
+        money(a->withdrawalCents / 100.0, withdrawals);
+        money((a->depositCents - a->withdrawalCents) / 100.0, net);
+        if (countsReport) {
+            snprintf(dc, sizeof(dc), "%d", a->deposits);
+            snprintf(wc, sizeof(wc), "%d", a->withdrawals);
+            const char *fields[] = {a->account->name, number, dc, wc, deposits, withdrawals, net};
+            outputRow(report, fields);
+        } else {
+            snprintf(period, sizeof(period), "%04d-%02d", a->period / 100, a->period % 100);
+            const char *fields[] = {a->account->name, number, period, deposits, withdrawals, net};
+            outputRow(report, fields);
         }
-    } else if (subChoice == 2) {
-        generateAllReports();
-    } else {
-        printf("Invalid choice.\n");
+    }
+    return closeReport(report);
+}
+
+/* A peak withdrawal measures single-transaction cash demand. Recency identifies inactivity. */
+static int writeAccountHistory(int recency, int date) {
+    Report peak = {"Report 4: Largest Withdrawal", "report4_largest_withdrawal.csv", 3,
+        {"AccountName","AccountNumber","LargestWithdrawal"}, NULL, 0};
+    Report recent = {"Report 4: Account Recency", "report4_account_recency.csv", 4,
+        {"AccountName","AccountNumber","LastTransactionDate","DaysSinceLastTransaction"}, NULL, 0};
+    Report *report = &peak;
+    if (recency) report = &recent;
+    if (!openReport(report)) return 0;
+    for (int i = 0; i < data.accountCount; i++) {
+        const Account *a = &data.accounts[i];
+        char number[32], value[64], days[32];
+        snprintf(number, sizeof(number), "%010lld", a->number);
+        if (recency) {
+            dateText(latest(a)->date, value);
+            snprintf(days, sizeof(days), "%ld", dayNumber(date) - dayNumber(latest(a)->date));
+        } else money(a->peak, value);
+        const char *fields[] = {a->name, number, value, days};
+        outputRow(report, fields);
+    }
+    return closeReport(report);
+}
+
+// Write summary totals as JSON numbers without thousands separators.
+static int writeSummary(double deposits, double withdrawals, double balance, double interest) {
+    char json[512];
+    snprintf(json, sizeof(json),
+        "{\n  \"total_accounts\": %d,\n  \"total_deposits\": %.2f,\n  \"total_withdrawals\": %.2f,\n"
+        "  \"total_balance\": %.2f,\n  \"total_interest_expense\": %.2f\n}\n",
+        data.accountCount, deposits, withdrawals, balance, interest);
+    FILE *fp = fopen("summary.json", "wb");
+    if (!fp) { perror("summary.json"); return 0; }
+    int failed = fputs(json, fp) == EOF;
+    if (fclose(fp) != 0 || failed) { perror("summary.json"); return 0; }
+    printf("Summary State (summary.json):\n%s", json);
+    return 1;
+}
+
+// Generate all reports from one dataset and aggregate the summary totals.
+static int generateReports(void) {
+    int date = data.latestDate;
+    if (!date) {
+        time_t clock = time(NULL);
+        struct tm *now = localtime(&clock);
+        if (!now) return 0;
+        date = (now->tm_year + 1900) * 10000 + (now->tm_mon + 1) * 100 + now->tm_mday;
+    }
+    int month = date / 100 - 1;
+    if (date / 100 % 100 == 1) month = (date / 10000 - 1) * 100 + 12;
+    char asOf[32];
+    dateText(date, asOf);
+    printf("Generating reports as of %s...\n", asOf);
+    size_t size = (size_t)data.count + 1, accounts = (size_t)data.accountCount + 1;
+    Activity *days = resize(NULL, size * sizeof(Activity));
+    Activity *months = resize(NULL, size * sizeof(Activity));
+    Activity *counts = resize(NULL, accounts * sizeof(Activity));
+    Account *ranked = resize(NULL, accounts * sizeof(Account));
+    int ndays = 0, nmonths = 0;
+    double deposits = 0, withdrawals = 0, balance = 0, interest = 0;
+    for (int i = 0; i < data.accountCount; i++) {
+        Account *a = &data.accounts[i];
+        counts[i] = (Activity){.account = a, .period = month};
+        a->average = averageBalance(a, month);
+        a->interest = 0;
+        a->peak = 0;
+        double closing = latest(a)->balance;
+        if (closing >= 10000) {
+            /* 30 days at 5% annually on an unchanged closing balance. */
+            long long balanceCents = llround(closing * 100);
+            double interestCents = balanceCents * 30 / (365.0 / ANNUAL_RATE);
+            a->interest = round(interestCents) / 100.0;
+            interest += a->interest;
+        }
+        balance += closing;
+        for (int j = a->first; j < a->end; j++) {
+            const Transaction *tx = &data.rows[j];
+            int txMonth = tx->date / 100;
+            if (j == a->first || days[ndays - 1].period != tx->date)
+                days[ndays++] = (Activity){.account = a, .period = tx->date};
+            if (j == a->first || months[nmonths - 1].period != txMonth)
+                months[nmonths++] = (Activity){.account = a, .period = txMonth};
+            // Aggregate daily and monthly activity in integer centavos.
+            accumulate(&days[ndays - 1], tx);
+            // Aggregate daily and monthly activity in integer centavos.
+            accumulate(&months[nmonths - 1], tx);
+            if (txMonth == month) accumulate(&counts[i], tx);
+            if (tx->deposit) deposits += tx->amount;
+            else {
+                withdrawals += tx->amount;
+                if (tx->amount > a->peak) a->peak = tx->amount;
+            }
+        }
+        ranked[i] = *a;
+    }
+    int ok = writePrivileges(ranked, data.accountCount, date) && writeInterest(ranked, data.accountCount)
+        && writeBehavior(days, ndays) && writeMonthly(months, nmonths, 0)
+        && writeMonthly(counts, data.accountCount, 1) && writeAccountHistory(0, date)
+        && writeAccountHistory(1, date) && writeSummary(deposits, withdrawals, balance, interest);
+    free(days);
+    free(months);
+    free(counts);
+    free(ranked);
+    return ok;
+}
+
+// Allow repeated reloads and exports until the user selects Back.
+static void reportMenu(void) {
+    for (;;) {
+        puts("\nGenerate Reports\n[1] Load the file\n[2] Generate Reports\n[0] Back");
+        int choice = readInt("Enter choice: ", 0, 2);
+        if (!choice) return;
+        if (choice == 1) loadData();
+        else generateReports();
     }
 }
 
-int main(void) {
-    int choice;
-
+// Load saved accounts and choose batch reports or the interactive menu.
+int main(int argc, char **argv) {
+    if (argc > 2 || (argc == 2 && strcmp(argv[1], "--reports"))) {
+        puts("Usage: bank [--reports]");
+        return EXIT_FAILURE;
+    }
+    if (!loadData()) return EXIT_FAILURE;
+    if (argc == 2) {
+        int ok = generateReports();
+        // Free transaction names and arrays owned by the dataset.
+        releaseDataset(&data);
+        if (!ok) return EXIT_FAILURE;
+        return EXIT_SUCCESS;
+    }
     do {
-        printf("\nSelect Transaction:\n");
-        printf("[1] Register Account\n");
-        printf("[2] Deposit Amount\n");
-        printf("[3] Withdraw Amount\n");
-        printf("[4] Currency Exchange\n");
-        printf("[5] Record Exchange Rates\n");
-        printf("[6] Show Interest Amount\n");
-        printf("[7] Generate Reports\n");
-
-        if (promptInt("\nChoice: ", &choice) != IN_OK) {
-            if (g_inputEnded) {
-                break;
-            }
-            choice = 0;
-        }
-
+        puts("\nMain Menu\nSelect Transaction:\n[1] Register Account\n[2] Deposit Amount\n[3] Withdraw Amount"
+             "\n[4] Currency Exchange\n[5] Record Exchange Rates\n[6] Show Interest Amount\n[7] Generate Reports\n[0] Exit");
+        int choice = readInt("Choice: ", 0, 7);
+        if (!choice) break;
         switch (choice) {
-            case 1: handleRegisterAccount(); break;
-            case 2: handleDepositAmount(); break;
-            case 3: handleWithdrawAmount(); break;
-            case 4: handleCurrencyExchange(); break;
-            case 5: handleRecordExchangeRates(); break;
-            case 6: handleShowInterestAmount(); break;
-            case 7: handleGenerateReports(); break;
-            default: printf("Invalid choice. Please select 1-7.\n"); break;
+            case 1: registerAccount(); break;
+            case 2: transact(1); break;
+            case 3: transact(0); break;
+            case 4: currencyExchange(); break;
+            case 5: recordExchangeRate(); break;
+            case 6: showInterest(); break;
+            case 7: reportMenu(); break;
         }
-    } while (!g_inputEnded && promptYesNo("\nBack to the Main Menu (Y/N): "));
-
-    return 0;
+    } while (yesNo("Back to the Main Menu (Y/N): "));
+    // Free transaction names and arrays owned by the dataset.
+    releaseDataset(&data);
+    puts("Thank you for using the application!");
+    return EXIT_SUCCESS;
 }

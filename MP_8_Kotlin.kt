@@ -1,5 +1,7 @@
 /*
 Last Names: Acosta, Cagigas, Pangilinan, Po
+Build: kotlinc MP_8_Kotlin.kt -include-runtime -d MP_8_Kotlin.jar
+Run: java -jar MP_8_Kotlin.jar [--reports]
 Language: Kotlin
 Paradigm(s): Object-Oriented Programming (OOP) and Procedural Programming
 */
@@ -28,6 +30,8 @@ val dateFormat = DateTimeFormatter.ofPattern("dd/MM/uuuu", Locale.US)
     .withResolverStyle(ResolverStyle.STRICT)
 val timeFormat = DateTimeFormatter.ofPattern("H:mm:ss", Locale.US)
     .withResolverStyle(ResolverStyle.STRICT)
+val moneyPattern = Regex("""[+-]?([0-9]+|[0-9]{1,3}(,[0-9]{3})+)(\.[0-9]+)?""")
+val inputTimePattern = Regex("""[0-9]{1,2}:[0-9]{2}:[0-9]{2}""")
 val outputTimeFormat = DateTimeFormatter.ofPattern("HH:mm:ss", Locale.US)
 
 // Each currency rate is the PHP value of one unit of that currency.
@@ -53,16 +57,27 @@ class Transaction(
     val type: String,
     val balance: Double,
     val rowNumber: Int
-)
+) : Comparable<Transaction> {
+    override fun compareTo(other: Transaction): Int = timestamp.compareTo(other.timestamp)
+}
 
 // Report 1 keeps each account together with its calculated monthly average.
-class PrivilegeRow(val account: Account, val average: Double)
+class PrivilegeRow(val account: Account, val average: Double) : Comparable<PrivilegeRow> {
+    override fun compareTo(other: PrivilegeRow): Int = other.average.compareTo(average)
+}
 
 // Report 2 keeps each account together with its projected interest.
-class InterestRow(val account: Account, val interest: Double)
+class InterestRow(val account: Account, val interest: Double) : Comparable<InterestRow> {
+    override fun compareTo(other: InterestRow): Int = other.interest.compareTo(interest)
+}
 
 // Report 3 collects one account's activity for one calendar day.
-class DailyActivity(val account: Account, val date: LocalDate) {
+class DailyActivity(val account: Account, val date: LocalDate) : Comparable<DailyActivity> {
+    override fun compareTo(other: DailyActivity): Int {
+        if (date != other.date) return date.compareTo(other.date)
+        return other.isSuspicious().compareTo(isSuspicious())
+    }
+
     var withdrawals = 0.0
     var depositCount = 0
     var deposits = 0.0
@@ -71,28 +86,21 @@ class DailyActivity(val account: Account, val date: LocalDate) {
     // The report displays N/A separately for withdrawal-only days.
     fun turnover(): Double {
         if (deposits > 0.0) {
-            return withdrawals / deposits * 100.0
+            return Math.round(withdrawals * 100) * 100.0 / Math.round(deposits * 100)
         } else {
             return 0.0
         }
     }
 
-    // Withdrawal-only days are suspicious under the documented zero-deposit rule.
     fun isSuspicious(): Boolean {
-        if (withdrawals >= 500000.0) {
-            return true
-        } else if (deposits == 0.0 && withdrawals > 0.0) {
-            return true
-        } else if (turnover() >= 90.0) {
-            return true
-        } else {
-            return false
-        }
+        return withdrawals >= 500000.0 || (deposits > 0 && turnover() >= 90.0)
     }
 }
 
 // Report 4 groups deposits and withdrawals by account and calendar month.
 class MonthlyActivity(val account: Account, val month: YearMonth) {
+    var depositCount = 0
+    var withdrawalCount = 0
     var deposits = 0.0
     var withdrawals = 0.0
 }
@@ -149,19 +157,19 @@ fun readInteger(prompt: String, minimum: Int, maximum: Int): Int {
 fun readAmount(prompt: String, minimum: Double): Double {
     while (true) {
         try {
-            val value = readInput(prompt).toDouble()
+            val value = parseAmount(readInput(prompt))
             if (!value.isFinite() || value <= 0.0) {
                 println("Error: Enter a positive, finite amount.")
             } else {
                 val amount = roundMoney(value)
-                if (amount >= minimum) {
+                if (value >= minimum && amount >= minimum) {
                     return amount
                 } else {
                     println("Error: Amount must be at least PHP " + formatMoney(minimum) + ".")
                 }
             }
         } catch (error: NumberFormatException) {
-            println("Error: Enter an amount without currency symbols or commas.")
+            println("Error: Enter a valid amount.")
         }
     }
 }
@@ -253,89 +261,27 @@ fun validAccountNumber(number: String): Boolean {
     return true
 }
 
-// These sorting functions use insertion sort: move earlier items right to make space.
-// Transactions must be chronological before we calculate account balances.
-fun sortTransactionsByDate(rows: ArrayList<Transaction>) {
-    var index = 1
-    while (index < rows.size) {
-        val current = rows[index]
-        var position = index
-        while (position > 0) {
-            val previous = rows[position - 1]
-            if (previous.timestamp.isAfter(current.timestamp) ||
-                (previous.timestamp == current.timestamp && previous.rowNumber > current.rowNumber)) {
-                rows[position] = previous
-                position--
-            } else {
-                break
-            }
-        }
-        rows[position] = current
-        index++
-    }
-}
-
-// Highest monthly average comes first. Equal averages keep account-number order.
-fun sortPrivilegeRows(rows: ArrayList<PrivilegeRow>) {
-    var index = 1
-    while (index < rows.size) {
-        val current = rows[index]
-        var position = index
-        while (position > 0 && rows[position - 1].average < current.average) {
-            rows[position] = rows[position - 1]
-            position--
-        }
-        rows[position] = current
-        index++
-    }
-}
-
-// Highest interest comes first. Equal interest amounts keep account-number order.
-fun sortInterestRows(rows: ArrayList<InterestRow>) {
-    var index = 1
-    while (index < rows.size) {
-        val current = rows[index]
-        var position = index
-        while (position > 0 && rows[position - 1].interest < current.interest) {
-            rows[position] = rows[position - 1]
-            position--
-        }
-        rows[position] = current
-        index++
-    }
-}
-
-// Dates come first; suspicious rows move ahead of normal rows on the same date.
-// The input list is already in date/account-number order from the TreeMap.
-fun sortDailyActivities(rows: ArrayList<DailyActivity>) {
-    var index = 1
-    while (index < rows.size) {
-        val current = rows[index]
-        var position = index
-        while (position > 0) {
-            val previous = rows[position - 1]
-            if (previous.date.isAfter(current.date) ||
-                (previous.date == current.date && current.isSuspicious() && !previous.isSuspicious())) {
-                rows[position] = previous
-                position--
-            } else {
-                break
-            }
-        }
-        rows[position] = current
-        index++
-    }
-}
-
 // Convert one PHP row into named values and reject invalid dates, money, or types.
+fun parseAmount(text: String): Double {
+    if (!moneyPattern.matches(text)) {
+        throw NumberFormatException("Invalid financial value.")
+    }
+    val value = text.replace(",", "").toDouble()
+    if (!value.isFinite() || value >= 1.0e12) throw NumberFormatException("Amount is too large.")
+    return value
+}
+
+// Validate the calendar date, time, transaction type, and financial fields.
 fun parseTransaction(fields: List<String>, rowNumber: Int): Transaction {
     val accountName = fields[0]
     val accountNumber = fields[1]
     val date = LocalDate.parse(fields[2], dateFormat)
+    if (date.year !in 1..9999) throw IllegalArgumentException("Invalid year.")
+    if (!inputTimePattern.matches(fields[3])) throw IllegalArgumentException("Invalid time.")
     val time = LocalTime.parse(fields[3], timeFormat)
-    val amount = fields[5].replace(",", "").toDouble()
+    val amount = parseAmount(fields[5])
     val type = fields[6].lowercase(Locale.US)
-    val balance = fields[7].replace(",", "").toDouble()
+    val balance = parseAmount(fields[7])
 
     if (!amount.isFinite() || !balance.isFinite() || amount <= 0.0 || balance < 0.0) {
         throw IllegalArgumentException("Invalid amount or balance.")
@@ -347,6 +293,7 @@ fun parseTransaction(fields: List<String>, rowNumber: Int): Transaction {
         throw IllegalArgumentException("Amount rounds to zero.")
     }
     return Transaction(accountName, accountNumber, date.atTime(time),
+        // Round monetary results to centavos using half-up rounding.
         roundMoney(amount), type, roundMoney(balance), rowNumber)
 }
 
@@ -389,7 +336,7 @@ fun loadData(): Boolean {
     var errorCount = 0
     var warningCount = 0
     try {
-        if (!file.exists()) {
+        if (!file.exists() || file.length() == 0L) {
             file.writeText(CSV_HEADER + "\n", Charsets.UTF_8)
         }
         // A 10,000-row dataset fits in memory; readLines also closes the file for us.
@@ -439,7 +386,7 @@ fun loadData(): Boolean {
         }
 
         // Sort before rebuilding accounts so the latest balance is chosen by timestamp.
-        sortTransactionsByDate(loadedTransactions)
+        loadedTransactions.sort()
         val loadedAccounts = TreeMap<String, Account>()
         for (transaction in loadedTransactions) {
             warningCount += addLoadedTransaction(transaction, loadedAccounts, log)
@@ -486,6 +433,11 @@ fun selectAccount(): Account? {
         if (input == "0") {
             return null
         }
+        var lookup = input
+        val comma = input.indexOf(',')
+        if (comma > 0 && input.indexOf(',', comma + 1) < 0) {
+            lookup = input.substring(comma + 1).trim() + " " + input.substring(0, comma).trim()
+        }
         val numberedAccount = accounts[input]
         if (numberedAccount != null) {
             return numberedAccount
@@ -493,7 +445,7 @@ fun selectAccount(): Account? {
         var match: Account? = null
         var matches = 0
         for (account in accounts.values) {
-            if (account.name.equals(input, true)) {
+            if (account.name.equals(input, true) || account.name.equals(lookup, true)) {
                 match = account
                 matches++
             }
@@ -531,7 +483,7 @@ fun saveTransaction(account: Account, amount: Double, type: String): Boolean {
     if (type == "withdrawal") {
         updatedBalance = account.balance - amount
     }
-    if (!updatedBalance.isFinite() || updatedBalance < 0.0) {
+    if (!updatedBalance.isFinite() || updatedBalance < 0.0 || updatedBalance >= 1.0e12) {
         println("Error: The resulting balance is invalid.")
         return false
     }
@@ -573,7 +525,7 @@ fun registerAccount() {
             return
         }
         var name = readInput("Account Name (First name Last name): ")
-        while (name.isBlank() || !name.contains(' ')) {
+        while (!name.contains(' ')) {
             println("Error: Enter a first name and last name.")
             name = readInput("Account Name: ")
         }
@@ -584,6 +536,7 @@ fun registerAccount() {
             accounts[number] = account
             highestAccountNumber++
             println("Account created successfully!")
+            // Display the same account details for deposits, withdrawals, and interest.
             printAccount(account)
         }
         again = askYesNo("Register another account? (Y/N): ")
@@ -605,6 +558,7 @@ fun transact(type: String) {
         if (account == null) {
             return
         }
+        // Display the same account details for deposits, withdrawals, and interest.
         printAccount(account)
         val amount = readAmount(title + ": ", 0.01)
         if (type == "withdrawal" && amount > account.balance) {
@@ -663,18 +617,15 @@ fun recordExchangeRate() {
 }
 
 // Interest is compounded daily, rounding each day's interest before adding it.
-fun calculateInterest(balance: Double, days: Int, display: Boolean): Double {
+fun calculateInterest(balance: Double, days: Int) {
     var projectedBalance = balance
     var day = 1
     while (day <= days) {
         val interest = roundMoney(projectedBalance * (ANNUAL_INTEREST_RATE / 365.0))
         projectedBalance = roundMoney(projectedBalance + interest)
-        if (display) {
-            println("$day | " + formatMoney(interest) + " | " + formatMoney(projectedBalance) + " |")
-        }
+        println("$day | " + formatMoney(interest) + " | " + formatMoney(projectedBalance) + " |")
         day++
     }
-    return roundMoney(projectedBalance - balance)
 }
 
 // Display a daily projection without saving it as an actual deposit.
@@ -684,11 +635,12 @@ fun showInterest() {
     if (account == null) {
         return
     }
+    // Display the same account details for deposits, withdrawals, and interest.
     printAccount(account)
     println("Interest Rate: 5% per annum")
     val days = readInteger("Total Number of Days: ", 1, 36500)
     println("Day | Interest | Balance |")
-    calculateInterest(account.balance, days, true)
+    calculateInterest(account.balance, days)
 }
 
 // Historical reports use the latest valid PHP date, independent of the computer date.
@@ -719,10 +671,10 @@ fun averageDailyBalance(account: Account, month: YearMonth): Double {
             balance = account.transactions[index].balance
             index++
         }
-        total += balance
+        total += Math.round(balance * 100.0) // Carry the closing balance through inactive days.
         day++
     }
-    return total / month.lengthOfMonth()
+    return total / (100.0 * month.lengthOfMonth())
 }
 
 // Every report uses the same quoted CSV format and a two-row console preview.
@@ -751,7 +703,7 @@ fun generatePrivilegeReport(date: LocalDate) {
             results.add(PrivilegeRow(account, average))
         }
     }
-    sortPrivilegeRows(results)
+    results.sort()
     val rows = ArrayList<List<String>>()
     for (result in results) {
         var tier = "Silver"
@@ -770,19 +722,22 @@ fun generatePrivilegeReport(date: LocalDate) {
         ))
     }
     println("Report 1: Banking Privilege Tiers ($month)")
+    // Write the CSV report and display its first two rows as a preview.
     writeReport("report1_banking_privilege_tiers.csv",
         listOf("AccountName", "AccountAge", "CurrentBalance", "AverageDailyBalance", "PrivilegeTier"), rows)
 }
 
-// Report 2 uses the same daily interest calculation as the existing interest menu.
+// Project 30 days at the latest balance and round the total interest once.
 fun generateInterestReport(): Double {
     val results = ArrayList<InterestRow>()
     for (account in accounts.values) {
         if (account.balance >= 10000.0) {
-            results.add(InterestRow(account, calculateInterest(account.balance, 30, false)))
+            val balanceCents = Math.round(account.balance * 100.0)
+            val interestCents = balanceCents * 30 / (365.0 / ANNUAL_INTEREST_RATE)
+            results.add(InterestRow(account, Math.round(interestCents) / 100.0))
         }
     }
-    sortInterestRows(results)
+    results.sort()
     val rows = ArrayList<List<String>>()
     var totalInterest = 0.0
     for (result in results) {
@@ -790,6 +745,7 @@ fun generateInterestReport(): Double {
         rows.add(listOf(result.account.name, formatMoney(result.account.balance), formatMoney(result.interest)))
     }
     println("Report 2: Interest Expense Projection (30 days)")
+    // Write the CSV report and display its first two rows as a preview.
     writeReport("report2_interest_expense_projection.csv",
         listOf("AccountName", "CurrentBalance", "ExpectedInterest"), rows)
     return roundMoney(totalInterest)
@@ -817,10 +773,10 @@ fun generateSuspiciousReport() {
         }
     }
     val results = ArrayList<DailyActivity>(grouped.values)
-    sortDailyActivities(results)
+    results.sort()
     val rows = ArrayList<List<String>>()
     for (activity in results) {
-        var turnover = "N/A"
+        var turnover = "N/A" // Division by zero has no defined percentage.
         if (activity.deposits > 0.0 || activity.withdrawals == 0.0) {
             turnover = formatMoney(activity.turnover())
         }
@@ -832,12 +788,14 @@ fun generateSuspiciousReport() {
             activity.depositCount.toString(), formatMoney(activity.deposits), turnover, risk))
     }
     println("Report 3: Suspicious Client Behavior")
+    // Write the CSV report and display its first two rows as a preview.
     writeReport("report3_suspicious_client_behavior.csv", listOf("AccountName", "Date", "TotalWithdrawalAmounts",
         "NumberOfDeposits", "TotalDepositAmounts", "TurnoverVelocity (%)", "RiskFlagLevel"), rows)
 }
 
 // Report 4 shows funding trends: positive net cash flow adds funds; negative removes them.
-fun generateCashFlowReport() {
+fun generateCustomReports(date: LocalDate) {
+    val monthOfReport = YearMonth.from(date).minusMonths(1)
     val grouped = TreeMap<String, MonthlyActivity>()
     for (transaction in transactions) {
         val account = accounts[transaction.accountNumber]
@@ -850,8 +808,10 @@ fun generateCashFlowReport() {
                 grouped[key] = activity
             }
             if (transaction.type == "deposit") {
+                activity.depositCount++
                 activity.deposits = roundMoney(activity.deposits + transaction.amount)
             } else {
+                activity.withdrawalCount++
                 activity.withdrawals = roundMoney(activity.withdrawals + transaction.amount)
             }
         }
@@ -863,8 +823,44 @@ fun generateCashFlowReport() {
             formatMoney(activity.deposits), formatMoney(activity.withdrawals), formatMoney(net)))
     }
     println("Report 4: Monthly Net Cash Flow per Account")
+    // Write the CSV report and display its first two rows as a preview.
     writeReport("report4_monthly_net_cash_flow.csv", listOf("AccountName", "AccountNumber", "Month",
         "TotalDeposits", "TotalWithdrawals", "NetCashFlow"), rows)
+
+    // Counts distinguish frequent small transactions from a single large movement.
+    val activityRows = ArrayList<List<String>>()
+    val peakRows = ArrayList<List<String>>()
+    val recencyRows = ArrayList<List<String>>()
+    for (account in accounts.values) {
+        val key = monthOfReport.toString() + "|" + account.number
+        var activity = grouped[key]
+        if (activity == null) activity = MonthlyActivity(account, monthOfReport)
+        activityRows.add(listOf(account.name, account.number, activity.depositCount.toString(),
+            activity.withdrawalCount.toString(), formatMoney(activity.deposits), formatMoney(activity.withdrawals),
+            formatMoney(roundMoney(activity.deposits - activity.withdrawals))))
+
+        // Largest withdrawal shows each client's peak single-transaction cash demand.
+        var peak = 0.0
+        for (tx in account.transactions) {
+            if (tx.type == "withdrawal" && tx.amount > peak) peak = tx.amount
+        }
+        peakRows.add(listOf(account.name, account.number, formatMoney(peak)))
+        // Days since last use identifies accounts that may need a follow-up.
+        val latest = account.transactions.last().timestamp.toLocalDate()
+        recencyRows.add(listOf(account.name, account.number, latest.format(dateFormat),
+            ChronoUnit.DAYS.between(latest, date).toString()))
+    }
+    println("Report 4: Monthly Account Activity ($monthOfReport)")
+    // Write the CSV report and display its first two rows as a preview.
+    writeReport("report4_monthly_account_activity.csv", listOf("AccountName", "AccountNumber", "DepositCount",
+        "WithdrawalCount", "TotalDeposits", "TotalWithdrawals", "NetCashFlow"), activityRows)
+    println("Report 4: Largest Withdrawal")
+    // Write the CSV report and display its first two rows as a preview.
+    writeReport("report4_largest_withdrawal.csv", listOf("AccountName", "AccountNumber", "LargestWithdrawal"), peakRows)
+    println("Report 4: Account Recency")
+    // Write the CSV report and display its first two rows as a preview.
+    writeReport("report4_account_recency.csv", listOf("AccountName", "AccountNumber", "LastTransactionDate",
+        "DaysSinceLastTransaction"), recencyRows)
 }
 
 // Summary totals use all valid PHP history and one latest balance per account.
@@ -894,10 +890,10 @@ fun writeSummary(totalInterest: Double) {
 }
 
 // Generate the reports together so the CSV files and summary share one dataset.
-fun generateReports() {
+fun generateReports(): Boolean {
     if (!dataLoaded) {
         println("Error: Load the file before generating reports.")
-        return
+        return false
     }
     val date = reportDate()
     println("\nGenerating reports as of " + date.format(dateFormat) + "...\n")
@@ -905,11 +901,14 @@ fun generateReports() {
         generatePrivilegeReport(date)
         val totalInterest = generateInterestReport()
         generateSuspiciousReport()
-        generateCashFlowReport()
+        generateCustomReports(date)
+        // Write summary totals as JSON numbers without thousands separators.
         writeSummary(totalInterest)
         println("All reports saved successfully.")
+        return true
     } catch (error: IOException) {
         println("Error: Could not finish writing the reports. " + error.message)
+        return false
     }
 }
 
@@ -923,8 +922,10 @@ fun reportMenu() {
         println("[0] Back")
         val choice = readInteger("Enter choice: ", 0, 2)
         if (choice == 1) {
+            // Validate into a temporary dataset before replacing the active accounts.
             loadData()
         } else if (choice == 2) {
+            // Generate all reports from one dataset and aggregate the summary totals.
             generateReports()
         } else {
             running = false
@@ -936,13 +937,11 @@ fun reportMenu() {
 fun main(args: Array<String>) {
     if (args.size > 1 || (args.size == 1 && args[0] != "--reports")) {
         println("Usage: java -jar MP_8_Kotlin.jar [--reports]")
-        return
+        kotlin.system.exitProcess(1)
     }
-    if (!loadData()) {
-        return
-    }
+    if (!loadData()) kotlin.system.exitProcess(1)
     if (args.size == 1) {
-        generateReports()
+        if (!generateReports()) kotlin.system.exitProcess(1)
         return
     }
     try {
@@ -962,18 +961,25 @@ fun main(args: Array<String>) {
             if (choice == 0) {
                 running = false
             } else if (choice == 1) {
+                // Assign the next available account number and save its initial deposit.
                 registerAccount()
             } else if (choice == 2) {
+                // Share deposit and withdrawal prompts while checking the resulting balance.
                 transact("deposit")
             } else if (choice == 3) {
+                // Share deposit and withdrawal prompts while checking the resulting balance.
                 transact("withdrawal")
             } else if (choice == 4) {
+                // Convert the source amount through PHP into the selected target currency.
                 currencyExchange()
             } else if (choice == 5) {
+                // Update a foreign exchange rate for this session while keeping PHP fixed at one.
                 recordExchangeRate()
             } else if (choice == 6) {
+                // Display daily compounded interest without saving projected deposits.
                 showInterest()
             } else if (choice == 7) {
+                // Allow repeated reloads and exports until the user selects Back.
                 reportMenu()
             }
             if (running) {
