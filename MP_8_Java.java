@@ -1,11 +1,7 @@
 /*
- * MCO2 - Banking Deposit and Withdrawal Reports
  * Last Names: Acosta, Cagigas, Pangilinan, Po
  * Language: Java
  * Paradigm(s): Object-Oriented Programming
- *
- * Compile: javac MP_8_Java.java
- * Run:     java MP_8_Java [--reports]
  */
 
 import java.io.BufferedReader;

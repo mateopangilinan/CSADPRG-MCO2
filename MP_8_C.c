@@ -2,8 +2,6 @@
 Last Names: Acosta, Cagigas, Pangilinan, Po
 Language: C
 Paradigm: Procedural programming
-Build: gcc -std=c11 -Wall -Wextra MP_8_C.c -o bank -lm
-Run: ./bank [--reports]
 */
 
 #include <stdio.h>

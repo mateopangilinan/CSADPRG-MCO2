@@ -1,9 +1,6 @@
 # Last Names: Acosta, Cagigas, Pangilinan, Po
 # Language: R
 # Paradigm: Procedural programming
-# Run: Rscript MP_8.R.r [--reports]
-# Reports use the latest valid PHP date as their reference date.
-# The earliest transaction is treated as the account opening date.
 
 data_file <- "bank_transactions.csv"
 header <- c("account_name", "account_number", "date", "time",

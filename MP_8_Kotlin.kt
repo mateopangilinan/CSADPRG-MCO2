@@ -1,7 +1,5 @@
 /*
 Last Names: Acosta, Cagigas, Pangilinan, Po
-Build: kotlinc MP_8_Kotlin.kt -include-runtime -d MP_8_Kotlin.jar
-Run: java -jar MP_8_Kotlin.jar [--reports]
 Language: Kotlin
 Paradigm(s): Object-Oriented Programming (OOP) and Procedural Programming
 */
